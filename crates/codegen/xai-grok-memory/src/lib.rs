@@ -21,6 +21,20 @@
 //! Memory is gated behind `--experimental-memory` CLI flag or
 //! `GROK_MEMORY=1` environment variable. When disabled, this crate
 //! is not initialized by the host.
+//!
+//! ## Session-scoped recall tier (experimental "infinite context")
+//!
+//! In addition to the cross-session markdown tier above, the index supports a
+//! finer, per-conversation tier keyed by `session_id`. Turns are written with
+//! [`MemoryIndex::index_session_turn`] and retrieved with [`session_recall`],
+//! which returns the top-K relevant chunks from *this* session for injection as
+//! a `<prior_context>` block ([`assemble_prior_context`]) instead of replaying
+//! older history. This path is selected by
+//! [`xai_grok_config_types::ContextMode::Recall`] and is opt-in; the default
+//! ([`ContextMode::Compact`](xai_grok_config_types::ContextMode::Compact))
+//! preserves today's threshold-triggered compaction behavior. Host trigger
+//! wiring (CLI flag, outgoing-message truncation, telemetry) lives in
+//! `xai-grok-shell` and is layered on top of these primitives.
 
 pub mod archive;
 pub mod backend;
@@ -33,12 +47,14 @@ pub mod mmr;
 pub mod query_expansion;
 pub mod schema;
 pub mod search;
+pub mod session_recall;
 pub mod storage;
 pub mod text_utils;
 pub mod watcher;
 
 pub use backend::{EndpointScopedCredentials, MemoryBackendImpl, MemoryBackendParams};
 pub use index::{MemoryIndex, init_sqlite_vec};
+pub use session_recall::{assemble_prior_context, session_recall};
 pub use storage::{MemoryScope, MemoryStorage};
 
 /// Embed all chunks that don't have embeddings yet.

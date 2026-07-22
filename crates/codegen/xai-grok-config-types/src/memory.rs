@@ -258,6 +258,145 @@ impl Default for MemorySessionConfig {
     }
 }
 
+/// Prompt-assembly strategy for keeping per-turn context size bounded on long
+/// sessions (`[memory.context_mode]` / `--context-mode`).
+///
+/// This is the selector for the experimental "infinite context" retrieval path.
+/// It is **opt-in** and mirrors the existing `--experimental-memory` convention:
+/// the default (`Compact`) preserves today's behavior exactly.
+///
+/// - [`ContextMode::Compact`] — today's behavior: threshold-triggered LLM
+///   summarization (`xai-grok-compaction`) produces a growing summary blob.
+/// - [`ContextMode::Recall`] — session-scoped retrieval: embed the latest turn,
+///   retrieve the top-K relevant chunks from a session-scoped index, and inject
+///   a `<prior_context>` block in place of replaying older history. When active,
+///   recall fully suppresses threshold auto-compaction (the two do not stack).
+/// - [`ContextMode::Full`] — no compaction and no recall; replay the entire
+///   transcript verbatim. Escape hatch for short sessions or debugging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextMode {
+    /// Threshold-triggered LLM summarization (default; today's behavior).
+    #[default]
+    Compact,
+    /// Session-scoped top-K retrieval with a `<prior_context>` injection.
+    Recall,
+    /// Replay the entire transcript verbatim (no compaction, no recall).
+    Full,
+}
+
+impl ContextMode {
+    /// Environment variable that selects the context mode, mirroring the
+    /// `GROK_MEMORY` convention used for `--experimental-memory`.
+    pub const ENV_VAR: &'static str = "GROK_CONTEXT_MODE";
+
+    /// String form used by the CLI flag, config file, and env var.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContextMode::Compact => "compact",
+            ContextMode::Recall => "recall",
+            ContextMode::Full => "full",
+        }
+    }
+
+    /// Whether this mode retrieves session-scoped context instead of replaying
+    /// or summarizing older history.
+    pub fn is_recall(&self) -> bool {
+        matches!(self, ContextMode::Recall)
+    }
+
+    /// Read the mode from [`ContextMode::ENV_VAR`]. Returns `None` when the
+    /// variable is unset; falls back to [`ContextMode::default`] (via
+    /// `unwrap_or_default` on the caller) for unparseable values after logging.
+    pub fn from_env() -> Option<ContextMode> {
+        let raw = std::env::var(Self::ENV_VAR).ok()?;
+        match raw.parse() {
+            Ok(mode) => Some(mode),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "unrecognized {} value; ignoring (falling back to default)",
+                    Self::ENV_VAR,
+                );
+                None
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for ContextMode {
+    type Err = ContextModeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "compact" => Ok(ContextMode::Compact),
+            "recall" => Ok(ContextMode::Recall),
+            "full" => Ok(ContextMode::Full),
+            _ => Err(ContextModeParseError(s.to_string())),
+        }
+    }
+}
+
+impl std::fmt::Display for ContextMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when a context-mode string cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextModeParseError(pub String);
+
+impl std::fmt::Display for ContextModeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid context mode {:?} (expected one of: compact, recall, full)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ContextModeParseError {}
+
+/// Session-scoped recall configuration (`[memory.recall]`).
+///
+/// Tunes the [`ContextMode::Recall`] retrieval path. All fields have sensible
+/// defaults so recall can be enabled with only the mode flag.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct RecallConfig {
+    /// Maximum number of prior-context chunks to inject per turn.
+    pub top_k: usize,
+    /// Minimum merged score (after normalization) for a chunk to be injected.
+    pub min_score: f32,
+    /// Weight for vector similarity when merging FTS + vector scores.
+    pub vector_weight: f32,
+    /// Weight for BM25 keyword similarity when merging FTS + vector scores.
+    pub text_weight: f32,
+    /// Candidate over-fetch multiplier for the vector KNN pass before the
+    /// session filter is applied. Because `chunks_vec` is not itself keyed by
+    /// `session_id`, a global KNN can return chunks from other sessions; we
+    /// over-fetch `top_k × overfetch` candidates and drop the out-of-session
+    /// ones. Clamped to at least 1 at use time.
+    pub vector_overfetch: usize,
+    /// MMR diversity re-ranking configuration (opt-in), reused from search.
+    pub mmr: MmrConfig,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            top_k: 8,
+            min_score: 0.3,
+            vector_weight: 0.7,
+            text_weight: 0.3,
+            vector_overfetch: 5,
+            mmr: MmrConfig::default(),
+        }
+    }
+}
+
 /// autoDream consolidation configuration (`[memory.dream]`).
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default)]
@@ -406,6 +545,63 @@ impl Default for PruningConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_mode_default_is_compact() {
+        // The experimental recall path must never be the default: a fresh
+        // config keeps today's compaction behavior.
+        assert_eq!(ContextMode::default(), ContextMode::Compact);
+        assert!(!ContextMode::default().is_recall());
+    }
+
+    #[test]
+    fn context_mode_parse_round_trips() {
+        for mode in [ContextMode::Compact, ContextMode::Recall, ContextMode::Full] {
+            let s = mode.as_str();
+            assert_eq!(s.parse::<ContextMode>().unwrap(), mode);
+            assert_eq!(mode.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn context_mode_parse_is_case_and_space_insensitive() {
+        assert_eq!("  Recall ".parse::<ContextMode>().unwrap(), ContextMode::Recall);
+        assert_eq!("FULL".parse::<ContextMode>().unwrap(), ContextMode::Full);
+        assert_eq!("Compact".parse::<ContextMode>().unwrap(), ContextMode::Compact);
+    }
+
+    #[test]
+    fn context_mode_parse_rejects_unknown() {
+        let err = "summarize".parse::<ContextMode>().unwrap_err();
+        assert_eq!(err.0, "summarize");
+        assert!(err.to_string().contains("compact, recall, full"));
+    }
+
+    #[test]
+    fn context_mode_is_recall_only_for_recall() {
+        assert!(ContextMode::Recall.is_recall());
+        assert!(!ContextMode::Compact.is_recall());
+        assert!(!ContextMode::Full.is_recall());
+    }
+
+    #[test]
+    fn recall_config_defaults_are_conservative() {
+        let r = RecallConfig::default();
+        assert_eq!(r.top_k, 8);
+        assert!(r.vector_overfetch >= 1);
+        // Weights mirror the search defaults so recall scoring is familiar.
+        assert!((r.vector_weight + r.text_weight - 1.0).abs() < 1e-6);
+        assert!(!r.mmr.enabled, "MMR is opt-in for recall too");
+    }
+
+    #[test]
+    fn recall_config_deserializes_partial() {
+        // Only overriding top_k must keep the other fields at their defaults
+        // (the `#[serde(default)]` container attribute fills the rest).
+        let r: RecallConfig = serde_json::from_str(r#"{"top_k": 3}"#).unwrap();
+        assert_eq!(r.top_k, 3);
+        assert_eq!(r.min_score, RecallConfig::default().min_score);
+    }
 
     #[test]
     fn sub_config_defaults_match() {
