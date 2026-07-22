@@ -1,0 +1,97 @@
+name: Nightly build
+
+# Builds the `grok` binary (crates/codegen/xai-grok-pager-bin, artifact name
+# xai-grok-pager) for Linux x86_64 and aarch64 on every push to main, then
+# republishes them under a single rolling "nightly" GitHub Release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            arch_name: x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            arch_name: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Installs the exact toolchain pinned by rust-toolchain.toml (channel,
+      # components, targets) rather than relying on whatever ships on the
+      # runner image.
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # bin/protoc is a DotSlash wrapper; proto codegen (xai-proto-build)
+      # requires a working `protoc` and treats it as fatal under
+      # GITHUB_ACTIONS if none is found. See README's "Building from source".
+      - name: Install DotSlash
+        run: cargo install dotslash
+
+      - name: Build xai-grok-pager (release-dist)
+        run: cargo build --profile release-dist --locked -p xai-grok-pager-bin
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release-dist/xai-grok-pager dist/grok
+          strip dist/grok
+          tar -C dist -czf "grok-linux-${{ matrix.arch_name }}.tar.gz" grok
+          sha256sum "grok-linux-${{ matrix.arch_name }}.tar.gz" > "grok-linux-${{ matrix.arch_name }}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-linux-${{ matrix.arch_name }}
+          path: |
+            grok-linux-${{ matrix.arch_name }}.tar.gz
+            grok-linux-${{ matrix.arch_name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: grok-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish rolling nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          sha="${{ github.sha }}"
+          gh release delete nightly --repo "$repo" --yes --cleanup-tag || true
+          gh release create nightly dist/*.tar.gz dist/*.sha256 \
+            --repo "$repo" \
+            --target "$sha" \
+            --title "Nightly build ($(date -u +'%Y-%m-%d %H:%M UTC'))" \
+            --notes "Automated nightly build of \`grok\` from commit ${sha}. Built for Linux x86_64 and aarch64. Not guaranteed stable." \
+            --prerelease
