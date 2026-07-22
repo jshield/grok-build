@@ -3,9 +3,10 @@ pub mod watcher;
 use crate::bundle;
 use serde::Deserialize;
 pub use xai_grok_config_types::{
-    DEFAULT_RECENCY_DECAY, MemoryDreamConfig, MemoryEmbeddingConfig, MemoryFlushConfig,
-    MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig, MemorySearchConfig,
-    MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig, TemporalDecayConfig,
+    ContextMode, DEFAULT_RECENCY_DECAY, MemoryDreamConfig, MemoryEmbeddingConfig,
+    MemoryFlushConfig, MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig,
+    MemorySearchConfig, MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig,
+    RecallConfig, TemporalDecayConfig,
 };
 /// Full configuration for the memory system.
 ///
@@ -38,6 +39,17 @@ pub struct MemoryConfig {
     pub gc: MemoryGcConfig,
     /// autoDream consolidation settings.
     pub dream: MemoryDreamConfig,
+    /// Prompt-assembly strategy (experimental "infinite context" selector).
+    ///
+    /// Resolved from `[memory] context_mode` in config.toml, overridden by the
+    /// `GROK_CONTEXT_MODE` env var (mirroring the `GROK_MEMORY` convention).
+    /// Defaults to [`ContextMode::Compact`] — today's behavior. `Recall` is
+    /// only honored when memory is enabled; it falls back to `Compact` with a
+    /// warning otherwise (the session-scoped index it needs lives under memory).
+    pub context_mode: ContextMode,
+    /// Session-scoped recall tuning (`[memory.recall]`), used when
+    /// `context_mode = "recall"`.
+    pub recall: RecallConfig,
     /// Pre-compaction memory flush settings.
     ///
     /// **Note:** Configured under `[compaction.memory_flush]` in config.toml,
@@ -210,6 +222,26 @@ impl MemoryConfig {
         if no_memory {
             result.enabled = false;
         }
+
+        // Context mode: TOML `[memory] context_mode` (already loaded via serde)
+        // is overridden by the `GROK_CONTEXT_MODE` env var, mirroring the
+        // `GROK_MEMORY` opt-in convention. Env parse failures are logged and
+        // ignored inside `from_env` (keeping the TOML/default value).
+        if let Some(mode) = ContextMode::from_env() {
+            result.context_mode = mode;
+        }
+
+        // Recall needs the session-scoped index, which only exists when memory
+        // is enabled. If recall was requested without memory, fall back to
+        // compact rather than silently doing nothing.
+        if result.context_mode.is_recall() && !result.enabled {
+            tracing::warn!(
+                "context_mode=recall requires memory to be enabled \
+                 (--experimental-memory / GROK_MEMORY=1); falling back to compact"
+            );
+            result.context_mode = ContextMode::Compact;
+        }
+
         result
     }
 }
