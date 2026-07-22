@@ -32,6 +32,11 @@ pub struct ChatStateActor {
     state: ChatState,
     /// Pruning configuration for tool-result trimming.
     pruning_config: PruningConfig,
+    /// When `Some(n)`, recall (infinite-context) mode is active: the outgoing
+    /// request keeps only the leading system block plus the last `n` real-user
+    /// turns, and the recalled `<prior_context>` block stands in for the dropped
+    /// older history. `None` (the default) replays full history as before.
+    recall_keep_last_turns: Option<usize>,
     /// Persistence implementation — owned exclusively, called with `&mut self`.
     persistence: Box<dyn ChatPersistence>,
     /// Channel to receive commands from handles.
@@ -82,6 +87,7 @@ impl ChatStateActor {
         let actor = ChatStateActor {
             state: ChatState::new(initial_conversation, sampling_config),
             pruning_config,
+            recall_keep_last_turns: None,
             persistence,
             cmd_rx,
             event_tx,
@@ -205,6 +211,9 @@ impl ChatStateActor {
             }
             ChatStateCommand::UpdateSamplingConfig { config } => {
                 self.state.sampling_config = config;
+            }
+            ChatStateCommand::SetRecallTruncation { keep_last_turns } => {
+                self.recall_keep_last_turns = keep_last_turns;
             }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);

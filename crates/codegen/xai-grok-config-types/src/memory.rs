@@ -268,17 +268,18 @@ impl Default for MemorySessionConfig {
 /// - [`ContextMode::Compact`] — today's behavior: threshold-triggered LLM
 ///   summarization (`xai-grok-compaction`) produces a growing summary blob.
 /// - [`ContextMode::Recall`] — session-scoped retrieval: embed the latest turn,
-///   retrieve the top-K relevant chunks from a session-scoped index, and inject
-///   a `<prior_context>` block.
-///
-///   **M1 status:** the block is injected *in addition to* the normal history,
-///   and threshold auto-compaction stays active as a safety net. The end-state
-///   design — injecting recalled context *in place of* replaying older turns,
-///   with compaction suppressed so per-turn prompt size stays flat — depends on
-///   outgoing-history truncation that is deferred behind the long-session eval
-///   harness. Suppressing compaction before truncation exists would let context
-///   grow unbounded until a hard context-window overflow, so it is intentionally
-///   left on until the two land together.
+///   retrieve the top-K relevant chunks from a session-scoped index, inject a
+///   `<prior_context>` block into the system message, and truncate the outgoing
+///   request to the leading system block plus the last
+///   [`keep_last_turns`](RecallConfig::keep_last_turns) real-user turns. The
+///   recalled excerpts stand in for the dropped older turns, so per-turn prompt
+///   size stays bounded regardless of session length. Because truncation (not
+///   summarization) bounds the request, threshold auto-compaction is suppressed;
+///   the error-triggered emergency compaction remains as a backstop for a single
+///   oversized turn. Stored history is never modified — only the request copy —
+///   so the full transcript remains available to the recall index. The truncation
+///   is a sliding window today (a later refinement batches the drop with
+///   hysteresis to reduce prompt-cache churn).
 /// - [`ContextMode::Full`] — intended as an escape hatch that replays the entire
 ///   transcript verbatim with no compaction. **Not yet enforced:** the selector
 ///   is accepted (CLI/env/TOML) and stored, but the runtime does not yet
@@ -393,6 +394,13 @@ pub struct RecallConfig {
     pub vector_overfetch: usize,
     /// MMR diversity re-ranking configuration (opt-in), reused from search.
     pub mmr: MmrConfig,
+    /// Number of most-recent *real user* turns to keep verbatim in the outgoing
+    /// request. Older turns are dropped from the request copy (not from stored
+    /// history) and represented by the recalled `<prior_context>` block, so the
+    /// prompt stays bounded regardless of session length. The recalled excerpts
+    /// substitute for the dropped turns; auto-compaction is suppressed because
+    /// this truncation, not summarization, bounds the request.
+    pub keep_last_turns: usize,
 }
 
 impl Default for RecallConfig {
@@ -404,6 +412,7 @@ impl Default for RecallConfig {
             text_weight: 0.3,
             vector_overfetch: 5,
             mmr: MmrConfig::default(),
+            keep_last_turns: 6,
         }
     }
 }

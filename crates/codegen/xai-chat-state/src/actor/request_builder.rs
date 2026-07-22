@@ -5,6 +5,7 @@ use xai_grok_sampling_types::{
 };
 
 use super::ChatStateActor;
+use crate::compaction_utils::is_real_user_turn;
 use crate::events::ChatStateEvent;
 use crate::types::PruningConfig;
 
@@ -71,7 +72,11 @@ impl ChatStateActor {
         let body_bytes = conversation_body_bytes(&self.state.conversation);
         let inline_images = inline_image_count(&self.state.conversation);
         let needs_image_compaction = body_bytes >= IMAGE_COMPACT_TRIGGER_BYTES;
-        let needs_mutation = needs_prune || memory_reminder.is_some() || needs_image_compaction;
+        let recall_keep_last_turns = self.recall_keep_last_turns;
+        let needs_mutation = needs_prune
+            || memory_reminder.is_some()
+            || needs_image_compaction
+            || recall_keep_last_turns.is_some();
 
         // Only allocate the mutable working copy when a mutation path is taken.
         let mut eviction: Option<ImageEvictionOutcome> = None;
@@ -99,6 +104,26 @@ impl ChatStateActor {
             // Step 3: Inject memory reminder into the system message
             if let Some(reminder) = memory_reminder {
                 inject_memory_reminder(&mut items, &reminder);
+            }
+
+            // Step 4: Recall-mode outgoing-history truncation. Runs after the
+            // memory reminder is upserted into the system block (so the recalled
+            // `<prior_context>` survives the drop), keeping only the system block
+            // plus the last N real-user turns. The cut is at real-user
+            // boundaries, but a defensive `repair_history` still removes any
+            // orphaned tool result the drop could expose (belt-and-suspenders —
+            // provider 400s on a leading dangling ToolResult).
+            if let Some(keep) = recall_keep_last_turns {
+                let removed = truncate_for_recall(&mut items, keep);
+                if removed > 0 {
+                    let report = crate::compaction_utils::repair_history(&mut items);
+                    tracing::debug!(
+                        removed_items = removed,
+                        kept_turns = keep,
+                        repaired = report.changed(),
+                        "recall: truncated outgoing history"
+                    );
+                }
             }
 
             items
@@ -207,6 +232,80 @@ pub(crate) fn prune_conversation(conversation: &mut [ConversationItem], config: 
                 std::sync::Arc::<str>::from(format!("{head}{SOFT_TRIM_SEPARATOR}{tail}"));
         }
     }
+}
+
+// ============================================================================
+// Recall-mode outgoing-history truncation (request-copy only)
+// ============================================================================
+
+/// Drop older turns from the request copy, keeping the leading system block and
+/// the last `keep_last_turns` real-user turns. Returns the number of items
+/// removed (0 if nothing was dropped).
+///
+/// This is the request-side half of recall (infinite-context) mode: the stored
+/// conversation is never modified — only this copy — and the recalled
+/// `<prior_context>` block (already upserted into the system message by the
+/// caller) stands in for the dropped history, so per-turn prompt size stays
+/// bounded regardless of session length.
+///
+/// ## Tool-pairing safety
+///
+/// The cut is made at a *real-user-turn* boundary ([`is_real_user_turn`]), the
+/// same boundary the compaction pipeline treats as a turn start. A turn's
+/// assistant/tool-call/tool-result group always sits between its opening user
+/// message and the next user message, so removing whole turns before the cut
+/// never separates a `tool_call` from its `tool_result` and never leaves a
+/// leading orphaned `ToolResult`. The caller still runs `repair_history` as a
+/// defensive backstop for malformed inputs.
+///
+/// ## Cache behavior
+///
+/// This is a sliding window: each new user turn shifts the kept range by one and
+/// rewrites the request prefix, busting the server-side prompt cache on turns
+/// past the window. That is inherent to bounding the prompt by turn count;
+/// batching the drop with hysteresis (like image eviction) is a later
+/// refinement. Short sessions (fewer than `keep_last_turns` real-user turns) are
+/// never truncated, so the prefix stays byte-stable until the window fills.
+pub(crate) fn truncate_for_recall(
+    items: &mut Vec<ConversationItem>,
+    keep_last_turns: usize,
+) -> usize {
+    // Defensive: never drop the entire conversation.
+    if keep_last_turns == 0 {
+        return 0;
+    }
+
+    // Preserve the leading system block (usually one item; keep a consecutive
+    // run defensively).
+    let sys_end = items
+        .iter()
+        .position(|it| !matches!(it, ConversationItem::System(_)))
+        .unwrap_or(items.len());
+
+    // Cut index = the position of the `keep_last_turns`-th real-user turn
+    // counting back from the end. Everything from there to the end is kept.
+    let mut seen = 0usize;
+    let mut cut = None;
+    for i in (sys_end..items.len()).rev() {
+        if is_real_user_turn(&items[i]) {
+            seen += 1;
+            if seen == keep_last_turns {
+                cut = Some(i);
+                break;
+            }
+        }
+    }
+
+    // Fewer than `keep_last_turns` real-user turns present, or the cut lands at
+    // the start of the body: nothing to drop.
+    let Some(cut) = cut else { return 0 };
+    if cut <= sys_end {
+        return 0;
+    }
+
+    let removed = cut - sys_end;
+    items.drain(sys_end..cut);
+    removed
 }
 
 // ============================================================================
@@ -568,6 +667,93 @@ mod tests {
         inject_memory_reminder(&mut items, "Remember: user likes rust");
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], ConversationItem::System(_)));
+    }
+
+    // -- recall truncation tests --
+
+    /// `system` + `n` real-user turns, each turn = User, Assistant, ToolResult.
+    fn convo_turns(n: usize) -> Vec<ConversationItem> {
+        let mut v = vec![ConversationItem::system("sys")];
+        for i in 0..n {
+            v.push(ConversationItem::user(format!("q{i}")));
+            v.push(ConversationItem::assistant(format!("a{i}")));
+            v.push(ConversationItem::tool_result(format!("c{i}"), format!("r{i}")));
+        }
+        v
+    }
+
+    #[test]
+    fn truncate_keeps_system_and_last_n_turns() {
+        let mut conv = convo_turns(5); // 1 + 5*3 = 16 items
+        let removed = truncate_for_recall(&mut conv, 2);
+        // Keeps system + last 2 turns (6 items) = 7; drops the first 3 turns (9).
+        assert_eq!(removed, 9);
+        assert_eq!(conv.len(), 7);
+        assert!(matches!(conv[0], ConversationItem::System(_)));
+        // The tail begins at a real user turn — never a dangling ToolResult.
+        assert!(is_real_user_turn(&conv[1]));
+        assert_eq!(conv[1].text_content().trim(), "q3");
+        assert_eq!(conv[4].text_content().trim(), "q4");
+    }
+
+    #[test]
+    fn truncate_noop_when_fewer_turns_than_window() {
+        let mut conv = convo_turns(2);
+        let before = conv.len();
+        assert_eq!(truncate_for_recall(&mut conv, 5), 0);
+        assert_eq!(conv.len(), before);
+    }
+
+    #[test]
+    fn truncate_zero_window_is_noop() {
+        let mut conv = convo_turns(3);
+        let before = conv.len();
+        assert_eq!(truncate_for_recall(&mut conv, 0), 0);
+        assert_eq!(conv.len(), before);
+    }
+
+    #[test]
+    fn truncate_ignores_synthetic_user_boundaries() {
+        // A synthetic system-reminder User must not count as a turn boundary:
+        // keeping "1 turn" keeps the last *real* user, not the reminder.
+        let mut conv = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("q0"),
+            ConversationItem::assistant("a0"),
+            ConversationItem::system_reminder("reminder"),
+            ConversationItem::user("q1"),
+            ConversationItem::assistant("a1"),
+        ];
+        let removed = truncate_for_recall(&mut conv, 1);
+        assert_eq!(removed, 3, "drops q0, a0, and the synthetic reminder");
+        assert_eq!(conv.len(), 3);
+        assert!(matches!(conv[0], ConversationItem::System(_)));
+        assert!(is_real_user_turn(&conv[1]));
+        assert_eq!(conv[1].text_content().trim(), "q1");
+    }
+
+    #[test]
+    fn truncate_tail_starts_at_user_not_toolresult() {
+        let mut conv = convo_turns(4);
+        truncate_for_recall(&mut conv, 1);
+        // First post-system item is a User (clean turn start), not an orphaned
+        // ToolResult that would 400 the provider.
+        assert!(matches!(conv[1], ConversationItem::User(_)));
+    }
+
+    #[test]
+    fn truncate_no_system_block() {
+        // No leading System item: sys_end == 0, tail still starts at a user.
+        let mut conv = vec![
+            ConversationItem::user("q0"),
+            ConversationItem::assistant("a0"),
+            ConversationItem::user("q1"),
+            ConversationItem::assistant("a1"),
+        ];
+        let removed = truncate_for_recall(&mut conv, 1);
+        assert_eq!(removed, 2);
+        assert!(is_real_user_turn(&conv[0]));
+        assert_eq!(conv[0].text_content().trim(), "q1");
     }
 
     // -- image size-gated compaction tests --

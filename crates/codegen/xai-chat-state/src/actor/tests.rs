@@ -1416,6 +1416,34 @@ async fn build_request_includes_all_messages() {
 }
 
 #[tokio::test]
+async fn build_request_truncates_for_recall() {
+    let mut conv = vec![ConversationItem::system("sys")];
+    for i in 0..5 {
+        conv.push(ConversationItem::user(format!("q{i}")));
+        conv.push(ConversationItem::assistant(format!("a{i}")));
+    }
+    let h = TestHarness::with_conversation(conv);
+    h.handle.set_recall_truncation(Some(2));
+    // Sync point: ensure the fire-and-forget command is applied before build.
+    let _ = h.handle.get_conversation().await;
+
+    let request = h
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    // system + last 2 real-user turns (q3,a3,q4,a4) = 5 items.
+    assert_eq!(request.items.len(), 5);
+    assert!(matches!(request.items[0], ConversationItem::System(_)));
+    assert_eq!(request.items[1].text_content().trim(), "q3");
+    assert_eq!(request.items[3].text_content().trim(), "q4");
+
+    // Truncation is request-copy only: stored history is untouched (still 11).
+    let stored = h.handle.get_conversation().await;
+    assert_eq!(stored.len(), 11);
+}
+
+#[tokio::test]
 async fn build_request_with_empty_conversation() {
     let h = TestHarness::new();
     let request = h

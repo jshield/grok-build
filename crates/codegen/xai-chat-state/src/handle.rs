@@ -170,6 +170,16 @@ impl ChatStateHandle {
             .send(ChatStateCommand::UpdateSamplingConfig { config });
     }
 
+    /// Enable/disable recall-mode outgoing-history truncation. `Some(n)` keeps
+    /// the system block plus the last `n` real-user turns in each built request;
+    /// `None` restores full-history replay. Set once when a recall-mode session
+    /// spawns.
+    pub fn set_recall_truncation(&self, keep_last_turns: Option<usize>) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::SetRecallTruncation { keep_last_turns });
+    }
+
     /// Track that the agent edited a file path.
     pub fn record_agent_edited_path(&self, path: String) {
         let _ = self

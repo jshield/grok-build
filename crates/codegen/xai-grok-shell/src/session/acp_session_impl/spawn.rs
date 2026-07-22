@@ -435,6 +435,18 @@ pub(crate) async fn spawn_session_actor(
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),
     );
+    // In recall (infinite-context) mode, bound the outgoing request to the last
+    // N real-user turns — the recalled `<prior_context>` block stands in for the
+    // dropped older history, and threshold auto-compaction is suppressed because
+    // this truncation (not summarization) keeps the prompt bounded. Mirrors the
+    // `recall_mode` activation filter below.
+    if let Some(recall) = memory_config
+        .as_ref()
+        .filter(|mc| mc.enabled && mc.context_mode.is_recall())
+        .map(|mc| &mc.recall)
+    {
+        chat_state_handle.set_recall_truncation(Some(recall.keep_last_turns));
+    }
     if (!initial_prompt_texts.is_empty()
         || initial_total_tokens > 0
         || initial_last_compaction.is_some())

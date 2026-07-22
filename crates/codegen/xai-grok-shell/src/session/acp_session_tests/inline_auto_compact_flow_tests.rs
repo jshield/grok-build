@@ -293,6 +293,33 @@ async fn test_check_auto_compact_needed_uses_state() {
         })
         .await;
 }
+/// Recall (infinite-context) mode suppresses threshold auto-compaction: the
+/// outgoing request is bounded by history truncation, not summarization, so a
+/// context level that would normally trigger a compact must be a no-op.
+#[tokio::test(flavor = "current_thread")]
+async fn recall_mode_suppresses_auto_compact() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor =
+                create_test_actor(90_000, 100_000, 85, gateway_tx, persistence_tx).await;
+            // Baseline: 90% of the window would normally trigger a compaction.
+            assert!(
+                actor.check_auto_compact_needed().await.is_some(),
+                "control: 90% should trigger without recall mode"
+            );
+            // Activating recall mode must suppress it.
+            actor.memory.recall_mode = Some(crate::config::RecallConfig::default());
+            assert!(
+                actor.check_auto_compact_needed().await.is_none(),
+                "recall mode must suppress threshold auto-compaction"
+            );
+        })
+        .await;
+}
 /// Test that overriding context_window on the sampling config changes
 /// auto-compact behavior. This validates the A/B fork fix: forked sessions
 /// must use the new model's context window, not the source session's.

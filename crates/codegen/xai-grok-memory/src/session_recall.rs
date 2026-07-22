@@ -7,15 +7,14 @@
 //! latest user turn, retrieves the top-K most relevant prior chunks from *this
 //! conversation*, and injects them as a `<prior_context>` block.
 //!
-//! ## v1 scope (M1) — additive retrieval, not yet history replacement
+//! ## Scope
 //!
-//! In this milestone the `<prior_context>` block is injected *in addition to*
-//! the normal conversation history, and threshold auto-compaction stays active
-//! as a safety net. The end-state design — injecting recalled context *in place
-//! of* replaying older turns so per-turn prompt size stays flat, with
-//! compaction suppressed — depends on outgoing-history truncation that is
-//! deliberately deferred behind the long-session eval harness. Until then,
-//! recall augments rather than replaces history.
+//! The `<prior_context>` block stands in for older turns: the shell injects it
+//! into the system message and truncates the outgoing request to the last N
+//! real-user turns (`RecallConfig::keep_last_turns`), so per-turn prompt size
+//! stays bounded regardless of session length, and threshold auto-compaction is
+//! suppressed. Stored history is untouched — only the request copy is truncated
+//! — so the full transcript stays available to this index.
 //!
 //! Retrieval itself is a deliberately naive top-K: FTS + vector candidates,
 //! score normalization, an optional MMR diversity pass, and truncation. It does
@@ -238,11 +237,8 @@ pub(super) fn session_recall_merge(
 }
 
 /// Assemble a `<prior_context>` block from recalled chunks for injection into
-/// the outgoing prompt.
-///
-/// In M1 this augments the normal history (see the module docs); the end-state
-/// design injects it *in place of* replaying older turns once history
-/// truncation lands.
+/// the outgoing prompt, standing in for the older turns the request drops (see
+/// the module docs).
 ///
 /// Returns an empty string when `results` is empty, so callers can inject it
 /// unconditionally without emitting an empty block. Chunks are listed

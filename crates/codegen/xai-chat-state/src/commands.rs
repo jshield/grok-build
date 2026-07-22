@@ -121,6 +121,11 @@ pub enum ChatStateCommand {
     /// Update the sampling config (e.g., model switch).
     UpdateSamplingConfig { config: SamplingConfig },
 
+    /// Enable/disable recall-mode outgoing-history truncation. `Some(n)` keeps
+    /// the system block plus the last `n` real-user turns in the request;
+    /// `None` restores full-history replay.
+    SetRecallTruncation { keep_last_turns: Option<usize> },
+
     /// Track that the agent edited a file path.
     RecordAgentEditedPath { path: String },
 
