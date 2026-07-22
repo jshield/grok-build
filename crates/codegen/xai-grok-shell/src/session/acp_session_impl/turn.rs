@@ -1666,6 +1666,87 @@ impl SessionActor {
             crate::session::helpers::memory_context::format_memory_reminder(&results)
         })
     }
+    /// Session-scoped recall for the experimental infinite-context mode.
+    ///
+    /// Syncs prior conversation turns into the session-scoped index (idempotent
+    /// hash-diff) and returns a transient `<prior_context>` block retrieved for
+    /// the latest user query, or `None` when nothing relevant is found. The
+    /// caller injects the block with `persist = false`, so it is recomputed
+    /// fresh each turn and never accumulates in the stored history.
+    ///
+    /// Best-effort: any failure (memory off, index open error, embed failure)
+    /// yields `None` and the turn proceeds without injection.
+    pub(crate) async fn recall_prior_context(
+        &self,
+        recall_cfg: &crate::config::RecallConfig,
+    ) -> Option<String> {
+        let storage = self.memory.storage()?;
+        let params = self.memory.backend_params.as_ref()?;
+        let mut index = self.memory.open_index(&storage)?;
+
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let query =
+            crate::session::helpers::session_compact::extract_last_real_user_query(&conversation)
+                .unwrap_or_default();
+        if query.is_empty() {
+            return None;
+        }
+        let session_id = self.session_info.id.0.to_string();
+
+        // Index prior turns so recall reflects the whole conversation. Exclude
+        // the final user item (the current query) so it cannot be retrieved as
+        // its own prior context. Idempotent: unchanged turns are skipped.
+        let last_user_pos = conversation
+            .iter()
+            .rposition(|i| matches!(i, ConversationItem::User(_)));
+        for (idx, item) in conversation.iter().enumerate() {
+            if Some(idx) == last_user_pos {
+                continue;
+            }
+            let text = match item {
+                ConversationItem::User(u) if u.synthetic_reason.is_none() => item.text_content(),
+                ConversationItem::Assistant(_) => item.text_content(),
+                _ => continue,
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let turn_ref = format!("session://{session_id}/item/{idx}");
+            if let Err(e) = index.index_session_turn(&session_id, &turn_ref, text) {
+                tracing::warn!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    error = %e,
+                    "RECALL: failed to index session turn"
+                );
+            }
+        }
+
+        // Embed newly written chunks (best effort) so the vector pass can match;
+        // FTS-only recall still works without an embedding provider.
+        let provider = params.make_embedding_provider().await;
+        if let Some(ref p) = provider {
+            crate::session::memory::embed_missing_chunks(&index, p).await;
+        }
+        let provider_dyn = provider
+            .as_ref()
+            .map(|p| p as &dyn crate::session::memory::embedding::EmbeddingProvider);
+        let results =
+            crate::session::memory::session_recall(&index, provider_dyn, &query, &session_id, recall_cfg)
+                .await
+                .ok()?;
+
+        let block = crate::session::memory::assemble_prior_context(&results);
+        if block.is_empty() {
+            return None;
+        }
+        tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            results = results.len(),
+            "RECALL: injected prior_context block"
+        );
+        Some(block)
+    }
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's
     /// next step, pushing the call's `tool_result` (correction / retry error /
     /// terminal) as a side effect. Validates the args against `validator` and
@@ -1907,14 +1988,29 @@ impl SessionActor {
             self.drain_pending_interjections().await;
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
-            let memory_reminder = self.first_turn_memory_reminder().await;
+            // Context injection. In recall mode (experimental infinite-context)
+            // we retrieve session-scoped prior context and inject it transiently
+            // every turn (`persist = false`, recomputed each turn). Otherwise the
+            // one-shot first-turn cross-session memory reminder runs, persisted
+            // into the system message as before.
+            let recall_active = self.memory.recall_mode.is_some();
+            let (memory_reminder, persist_memory_reminder) =
+                if let Some(recall_cfg) = self.memory.recall_mode.clone() {
+                    (self.recall_prior_context(&recall_cfg).await, false)
+                } else {
+                    (
+                        self.first_turn_memory_reminder().await,
+                        self.memory.is_enabled(),
+                    )
+                };
             if memory_reminder.is_some() {
                 self.memory
                     .injection_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
                     target : xai_grok_telemetry::memory_log::TARGET,
-                    "MEMORY_INJECT: first-turn memory context injected"
+                    recall = recall_active,
+                    "MEMORY_INJECT: context injected"
                 );
             }
             self.maybe_inject_mcp_reminder().await;
@@ -1962,7 +2058,7 @@ impl SessionActor {
                 .build_request(
                     effective_tools,
                     memory_reminder,
-                    self.memory.is_enabled(),
+                    persist_memory_reminder,
                     trace_gcs_config
                         .clone()
                         .map(|cfg| -> Box<dyn crate::sampling::TraceContext> {

@@ -92,9 +92,10 @@ command = "$$HOME"
     let command = test.get("command").and_then(|v| v.as_str()).unwrap();
     assert_eq!(command, "$HOME");
 }
-/// Mutex to serialize tests that touch the GROK_MEMORY env var.
-/// Env vars are process-global, so parallel tests race on them.
-static MEMORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes tests that touch the GROK_MEMORY / GROK_CONTEXT_MODE env vars.
+/// Shared with `config::reloader::tests` (env vars are process-global, so tests
+/// across modules race on them) — see [`crate::config::MEMORY_ENV_LOCK`].
+use crate::config::MEMORY_ENV_LOCK;
 /// Run `f` with `name` set to `value` (Some) or removed (None).
 /// Saves and restores the previous value, even on panic.
 fn with_env_var_opt<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {

@@ -1451,6 +1451,13 @@ pub(crate) async fn spawn_session_actor(
                 .is_none_or(|mc| mc.session.save_on_end),
             backend_params: memory_backend_params_for_session,
             initial_injection_config: memory_initial_injection_config,
+            // Recall is active only when memory is enabled AND context_mode is
+            // recall (resolved in MemoryConfig, which already demotes recall to
+            // compact when memory is off — this filter is belt-and-suspenders).
+            recall_mode: memory_config
+                .as_ref()
+                .filter(|mc| mc.enabled && mc.context_mode.is_recall())
+                .map(|mc| mc.recall.clone()),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             flush_count: std::sync::atomic::AtomicU64::new(0),
             last_flush_content: std::cell::RefCell::new(None),

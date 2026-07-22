@@ -8,6 +8,13 @@ pub use xai_grok_config_types::{
     MemorySearchConfig, MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig,
     RecallConfig, TemporalDecayConfig,
 };
+/// Serializes tests that read or mutate the process-global `GROK_MEMORY` /
+/// `GROK_CONTEXT_MODE` env vars. Shared across the `config::tests` and
+/// `config::reloader::tests` modules so an env-mutating test in one cannot race
+/// a resolve in the other (both call `MemoryConfig::resolve`, which reads them).
+#[cfg(test)]
+pub(crate) static MEMORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Full configuration for the memory system.
 ///
 /// Parsed from the `[memory]` section of `~/.grok/config.toml` or

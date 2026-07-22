@@ -600,6 +600,13 @@ pub struct PagerArgs {
     /// Disable cross-session memory for this session.
     #[arg(long = "no-memory", conflicts_with = "experimental_memory")]
     pub no_memory: bool,
+    /// Experimental prompt-assembly strategy: `compact` (default; today's
+    /// threshold summarization), `recall` (session-scoped retrieval —
+    /// injects a `<prior_context>` block; requires memory), or `full` (no
+    /// compaction/recall). Overrides `GROK_CONTEXT_MODE`.
+    #[arg(long = "context-mode", value_name = "MODE",
+          value_parser = ["compact", "recall", "full"])]
+    pub context_mode: Option<String>,
     /// Agent name or definition file path.
     #[arg(long = "agent", value_name = "NAME")]
     pub agent: Option<String>,

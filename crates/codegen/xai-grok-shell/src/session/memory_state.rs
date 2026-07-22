@@ -19,6 +19,13 @@ pub struct SessionMemory {
     pub backend_params: Option<crate::session::memory::MemoryBackendParams>,
     /// First-turn memory injection behavior resolved from local + remote config.
     pub initial_injection_config: crate::config::MemoryInitialInjectionConfig,
+    /// When `Some`, session-scoped recall (the experimental "infinite context"
+    /// mode) is active, and the value carries its tuning. `None` when
+    /// `context_mode` is `compact`/`full` or memory is disabled. Set only when
+    /// `context_mode = recall` AND memory is enabled — the recall index lives
+    /// under the memory workspace, so recall requires memory. Gated behind the
+    /// `--context-mode recall` flag / `GROK_CONTEXT_MODE=recall`.
+    pub recall_mode: Option<crate::config::RecallConfig>,
     /// Per-process latch: the first-turn injection decision already ran in
     /// this session segment. Cross-segment idempotency comes from
     /// `conversation_has_memory_context`, not this flag.

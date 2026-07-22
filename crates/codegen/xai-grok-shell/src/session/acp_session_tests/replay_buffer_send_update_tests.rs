@@ -129,6 +129,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             save_on_end: true,
             backend_params: None,
             initial_injection_config: Default::default(),
+            recall_mode: None,
             context_injected: std::sync::atomic::AtomicBool::new(false),
             flush_count: std::sync::atomic::AtomicU64::new(0),
             last_flush_content: std::cell::RefCell::new(None),
