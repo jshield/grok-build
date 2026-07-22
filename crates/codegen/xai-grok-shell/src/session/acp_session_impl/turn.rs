@@ -1694,13 +1694,19 @@ impl SessionActor {
         let session_id = self.session_info.id.0.to_string();
 
         // Index prior turns so recall reflects the whole conversation. Exclude
-        // the final user item (the current query) so it cannot be retrieved as
-        // its own prior context. Idempotent: unchanged turns are skipped.
-        let last_user_pos = conversation
+        // the final *real* user item (the current query) so it cannot be
+        // retrieved as its own prior context. This must be the same turn the
+        // query was extracted from (`extract_last_real_user_query`), so use the
+        // shared `is_real_user_turn` predicate rather than the last raw `User`:
+        // a trailing synthetic user item (e.g. a system reminder) would
+        // otherwise leave the real query indexable. Idempotent: unchanged turns
+        // are skipped.
+        let last_real_user_pos = conversation
             .iter()
-            .rposition(|i| matches!(i, ConversationItem::User(_)));
+            .rposition(crate::session::helpers::session_compact::is_real_user_turn);
+        let mut indexed_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (idx, item) in conversation.iter().enumerate() {
-            if Some(idx) == last_user_pos {
+            if Some(idx) == last_real_user_pos {
                 continue;
             }
             let text = match item {
@@ -1720,6 +1726,19 @@ impl SessionActor {
                     "RECALL: failed to index session turn"
                 );
             }
+            indexed_refs.insert(turn_ref);
+        }
+
+        // Drop session chunks whose positional turn_ref is no longer present —
+        // compaction/rewind rewrites the conversation and shifts item indices,
+        // orphaning old `session://{id}/item/N` paths that would otherwise stay
+        // searchable for this session forever.
+        if let Err(e) = index.prune_session_chunks_not_in(&session_id, &indexed_refs) {
+            tracing::warn!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                error = %e,
+                "RECALL: failed to prune orphaned session chunks"
+            );
         }
 
         // Embed newly written chunks (best effort) so the vector pass can match;
@@ -1988,21 +2007,29 @@ impl SessionActor {
             self.drain_pending_interjections().await;
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
-            // Context injection. In recall mode (experimental infinite-context)
-            // we retrieve session-scoped prior context and inject it transiently
-            // every turn (`persist = false`, recomputed each turn). Otherwise the
-            // one-shot first-turn cross-session memory reminder runs, persisted
-            // into the system message as before.
+            // Context injection. Recall mode (experimental infinite-context)
+            // composes both memory paths: on the first turn it injects the
+            // one-shot cross-session memory reminder (persisted into the system
+            // message, exactly like compact mode) so project/global MEMORY.md is
+            // not lost on long sessions; from then on it injects per-turn
+            // session-scoped prior_context transiently (`persist = false`,
+            // recomputed each turn). `first_turn_memory_reminder` self-gates via
+            // the `context_injected` latch, so checking it here selects turn 1
+            // vs. the rest. Non-recall mode keeps the original behavior.
             let recall_active = self.memory.recall_mode.is_some();
-            let (memory_reminder, persist_memory_reminder) =
-                if let Some(recall_cfg) = self.memory.recall_mode.clone() {
+            let first_turn_pending = !self
+                .memory
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let (memory_reminder, persist_memory_reminder) = match self.memory.recall_mode.clone() {
+                Some(recall_cfg) if !first_turn_pending => {
                     (self.recall_prior_context(&recall_cfg).await, false)
-                } else {
-                    (
-                        self.first_turn_memory_reminder().await,
-                        self.memory.is_enabled(),
-                    )
-                };
+                }
+                _ => (
+                    self.first_turn_memory_reminder().await,
+                    self.memory.is_enabled(),
+                ),
+            };
             if memory_reminder.is_some() {
                 self.memory
                     .injection_count

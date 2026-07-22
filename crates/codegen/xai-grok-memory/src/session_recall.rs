@@ -5,13 +5,19 @@
 //! tier, this module retrieves only chunks tagged with a given `session_id`
 //! (written via [`MemoryIndex::index_session_turn`]). The caller embeds the
 //! latest user turn, retrieves the top-K most relevant prior chunks from *this
-//! conversation*, and injects them as a `<prior_context>` block in place of
-//! replaying older transcript history — keeping per-turn prompt size flat
-//! regardless of session length.
+//! conversation*, and injects them as a `<prior_context>` block.
 //!
-//! ## v1 scope (M1)
+//! ## v1 scope (M1) — additive retrieval, not yet history replacement
 //!
-//! This is deliberately a naive top-K retrieval: FTS + vector candidates,
+//! In this milestone the `<prior_context>` block is injected *in addition to*
+//! the normal conversation history, and threshold auto-compaction stays active
+//! as a safety net. The end-state design — injecting recalled context *in place
+//! of* replaying older turns so per-turn prompt size stays flat, with
+//! compaction suppressed — depends on outgoing-history truncation that is
+//! deliberately deferred behind the long-session eval harness. Until then,
+//! recall augments rather than replaces history.
+//!
+//! Retrieval itself is a deliberately naive top-K: FTS + vector candidates,
 //! score normalization, an optional MMR diversity pass, and truncation. It does
 //! **not** yet include the iterative draft/critique/refine loop (a later
 //! milestone). It reuses [`crate::search::SearchResult`] and
@@ -67,10 +73,7 @@ pub async fn session_recall(
     let query_embedding = if vec_available {
         if let Some(provider) = embedding_provider {
             match provider.embed_batch(&[query]).await {
-                Ok(embeddings) if !embeddings.is_empty() => {
-                    Some(embeddings.into_iter().next().unwrap())
-                }
-                Ok(_) => None,
+                Ok(embeddings) => embeddings.into_iter().next(),
                 Err(e) => {
                     tracing::warn!(error = %e, "session recall embed failed, FTS-only");
                     None
@@ -146,6 +149,12 @@ pub(super) fn session_recall_merge(
         fts_scores.keys().chain(vec_scores.keys()).collect();
 
     let mut ranked: Vec<(f64, SearchResult)> = Vec::new();
+    // Diagnostics for the global-KNN over-fetch (see module docs): in a busy
+    // index the nearest neighbors can be almost entirely out-of-session, and an
+    // all-dropped vector pass silently degrades recall to FTS-only. Counting
+    // kept vs. dropped makes under-retrieval visible in traces.
+    let mut vec_candidates_dropped = 0usize;
+    let mut vec_candidates_kept = 0usize;
 
     for chunk_id in all_chunk_ids {
         // Resolve the chunk and enforce the session filter here: FTS candidates
@@ -154,7 +163,15 @@ pub(super) fn session_recall_merge(
         let Some(chunk) = index.get_chunk(chunk_id).ok().flatten() else {
             continue;
         };
-        if chunk.session_id.as_deref() != Some(session_id) {
+        let in_session = chunk.session_id.as_deref() == Some(session_id);
+        if vec_scores.contains_key(chunk_id) {
+            if in_session {
+                vec_candidates_kept += 1;
+            } else {
+                vec_candidates_dropped += 1;
+            }
+        }
+        if !in_session {
             continue;
         }
 
@@ -188,6 +205,16 @@ pub(super) fn session_recall_merge(
         }
     }
 
+    if !vec_results.is_empty() {
+        tracing::debug!(
+            session_id = %session_id,
+            vec_candidates = vec_results.len(),
+            vec_kept = vec_candidates_kept,
+            vec_dropped = vec_candidates_dropped,
+            "session_recall: global-KNN over-fetch session filter"
+        );
+    }
+
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mmr_enabled = config.mmr.enabled;
@@ -211,7 +238,11 @@ pub(super) fn session_recall_merge(
 }
 
 /// Assemble a `<prior_context>` block from recalled chunks for injection into
-/// the outgoing prompt, in place of replaying older transcript history.
+/// the outgoing prompt.
+///
+/// In M1 this augments the normal history (see the module docs); the end-state
+/// design injects it *in place of* replaying older turns once history
+/// truncation lands.
 ///
 /// Returns an empty string when `results` is empty, so callers can inject it
 /// unconditionally without emitting an empty block. Chunks are listed
@@ -224,8 +255,8 @@ pub fn assemble_prior_context(results: &[SearchResult]) -> String {
     let mut out = String::from(
         "<prior_context>\n\
          Relevant excerpts retrieved from earlier in this session (most \
-         relevant first). Older turns are not replayed verbatim; if something \
-         you need is missing, use the memory recall tool to search for it.\n\n",
+         relevant first), surfaced to keep them salient. If something you need \
+         is missing, use the memory recall tool to search for it.\n\n",
     );
     for r in results {
         // Trim to avoid stacking blank lines from chunk boundaries.

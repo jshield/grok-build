@@ -11,7 +11,8 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 pub use xai_chat_state::compaction_utils::{
     AUTO_CONTINUE_PROMPT, extract_last_real_user_query, extract_last_user_query,
-    extract_messages_since_last_user, extract_real_user_queries, is_synthetic_extracted_query,
+    extract_messages_since_last_user, extract_real_user_queries, is_real_user_turn,
+    is_synthetic_extracted_query,
 };
 use xai_grok_sampler::SamplerConfig as SamplingConfig;
 /// Short, self-narrating compaction prompt used by the short-prompt harness only.

@@ -269,10 +269,21 @@ impl Default for MemorySessionConfig {
 ///   summarization (`xai-grok-compaction`) produces a growing summary blob.
 /// - [`ContextMode::Recall`] — session-scoped retrieval: embed the latest turn,
 ///   retrieve the top-K relevant chunks from a session-scoped index, and inject
-///   a `<prior_context>` block in place of replaying older history. When active,
-///   recall fully suppresses threshold auto-compaction (the two do not stack).
-/// - [`ContextMode::Full`] — no compaction and no recall; replay the entire
-///   transcript verbatim. Escape hatch for short sessions or debugging.
+///   a `<prior_context>` block.
+///
+///   **M1 status:** the block is injected *in addition to* the normal history,
+///   and threshold auto-compaction stays active as a safety net. The end-state
+///   design — injecting recalled context *in place of* replaying older turns,
+///   with compaction suppressed so per-turn prompt size stays flat — depends on
+///   outgoing-history truncation that is deferred behind the long-session eval
+///   harness. Suppressing compaction before truncation exists would let context
+///   grow unbounded until a hard context-window overflow, so it is intentionally
+///   left on until the two land together.
+/// - [`ContextMode::Full`] — intended as an escape hatch that replays the entire
+///   transcript verbatim with no compaction. **Not yet enforced:** the selector
+///   is accepted (CLI/env/TOML) and stored, but the runtime does not yet
+///   suppress compaction for it, so today it behaves like `Compact`. Enforcement
+///   is deferred alongside recall's compaction-suppression work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContextMode {

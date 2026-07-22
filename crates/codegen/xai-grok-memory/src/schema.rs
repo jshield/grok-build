@@ -8,13 +8,18 @@
 //! When sqlite-vec is available, a fourth table is created:
 //! - `chunks_vec` — vec0 virtual table for KNN vector search
 
-/// Schema version. Bump when making breaking schema changes that require
-/// dropping and recreating tables.
+/// Schema version, for documentation and future use.
+///
+/// Note: this constant is currently informational only — nothing reads or
+/// writes a `schema_version` meta key, and migrations are driven by runtime
+/// introspection (`pragma_table_info`) rather than a stored version. Treat it
+/// as a changelog marker, not a migration gate, until a versioned migration
+/// path exists.
 ///
 /// v2 added the nullable `chunks.session_id` column (+ `idx_chunks_session`)
 /// for session-scoped recall. It is applied additively via `ALTER TABLE` on
-/// pre-existing v1 databases (see [`ADD_SESSION_ID_COLUMN_SQL`]), so the bump
-/// does not force a drop/recreate.
+/// pre-existing v1 databases (see [`ADD_SESSION_ID_COLUMN_SQL`]), so it does
+/// not force a drop/recreate.
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// Generate the SQL schema for the memory index.

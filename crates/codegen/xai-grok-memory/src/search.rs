@@ -309,6 +309,18 @@ pub(super) fn hybrid_search_merge(
             continue;
         };
 
+        // Session-scoped conversation chunks (written by recall mode via
+        // `index_session_turn`) live in the per-session recall tier, retrieved
+        // only through `session_recall`. They must never surface in the
+        // cross-session memory tier: the FTS candidate pass (`search_fts`) and
+        // the global vector KNN are not session-filtered, so exclude them here
+        // — one guard covers both candidate sources. Without this, once a user
+        // runs recall mode the raw dialogue would pollute `memory_search` and
+        // first-turn injection for every session sharing this index.
+        if chunk.session_id.is_some() {
+            continue;
+        }
+
         // Filter at search time (not index time) so already-indexed stubs are
         // excluded without requiring a reindex.
         if is_content_free(&chunk.text, &chunk.source) {
@@ -426,6 +438,44 @@ mod tests {
             results[0].created_at > 0,
             "created_at must propagate from ChunkRecord (got {})",
             results[0].created_at,
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_excludes_session_chunks() {
+        // Session-scoped recall chunks must never leak into the cross-session
+        // memory tier, even though they share the `chunks`/`chunks_fts` tables
+        // and the FTS/vector candidate passes are not session-filtered.
+        let tmp = TempDir::new().unwrap();
+        let mut idx = test_index(&tmp);
+
+        // A workspace file chunk that matches the query.
+        let file_path = tmp.path().join("ws.md");
+        std::fs::write(&file_path, "# Guide\n\nDatabase migration runs before deploy.").unwrap();
+        idx.reindex_file(&file_path, "workspace").unwrap();
+
+        // A session-scoped conversation chunk that also matches the query.
+        idx.index_session_turn(
+            "sess-A",
+            "session://sess-A/item/3",
+            "# Turn\n\nDatabase migration decision from this conversation.",
+        )
+        .unwrap();
+
+        let config = MemorySearchConfig::default();
+        let results = hybrid_search(&idx, None, "database migration", &config)
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty(), "workspace chunk should still be found");
+        assert!(
+            results.iter().all(|r| r.source != "session"),
+            "cross-session search must exclude session-scoped chunks: {:?}",
+            results.iter().map(|r| (&r.source, &r.path)).collect::<Vec<_>>(),
+        );
+        assert!(
+            results.iter().all(|r| !r.path.starts_with("session://")),
+            "no session:// paths may surface in memory_search",
         );
     }
 

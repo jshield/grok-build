@@ -507,6 +507,58 @@ impl MemoryIndex {
         Ok(result)
     }
 
+    /// Delete session-scoped chunks for `session_id` whose owning `path`
+    /// (turn_ref) is not in `keep_refs`.
+    ///
+    /// [`index_session_turn`](Self::index_session_turn) keeps a single turn_ref
+    /// in sync, but positional turn_refs (`session://{id}/item/{idx}`) are
+    /// orphaned when the conversation is rewritten — compaction collapses turns
+    /// into a summary, rewind drops the tail — leaving high-index paths
+    /// searchable forever. Callers pass the set of turn_refs present in the
+    /// current conversation; everything else for this session is removed,
+    /// bounding index growth. Returns the number of chunks deleted.
+    pub fn prune_session_chunks_not_in(
+        &mut self,
+        session_id: &str,
+        keep_refs: &std::collections::HashSet<String>,
+    ) -> Result<usize, rusqlite::Error> {
+        // Collect first (can't hold the statement borrow across the deletes).
+        let stale: Vec<(String, i64, String)> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT id, rowid, text, path FROM chunks WHERE session_id = ?1")?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, // id
+                    row.get::<_, i64>(1)?,     // rowid
+                    row.get::<_, String>(2)?,  // text (for contentless FTS delete)
+                    row.get::<_, String>(3)?,  // path (turn_ref)
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, _, _, path)| !keep_refs.contains(path))
+                .map(|(id, rowid, text, _)| (id, rowid, text))
+                .collect()
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.db.transaction()?;
+        for (id, rowid, text) in &stale {
+            tx.execute(
+                "INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?1, ?2)",
+                params![rowid, text],
+            )?;
+            if self.vec_available {
+                let _ = tx.execute("DELETE FROM chunks_vec WHERE chunk_id = ?1", params![id]);
+            }
+            tx.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(stale.len())
+    }
+
     // -----------------------------------------------------------------------
     // Search
     // -----------------------------------------------------------------------
@@ -949,6 +1001,48 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let idx = test_index(&tmp);
         assert_eq!(idx.embedding_dimensions(), 1536);
+    }
+
+    #[test]
+    fn prune_session_chunks_removes_orphaned_turn_refs() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = test_index(&tmp);
+
+        // Three turns for one session, plus a chunk in a different session that
+        // must never be touched by a scoped prune.
+        idx.index_session_turn("sess-A", "session://sess-A/item/0", "# T\n\nAlpha.")
+            .unwrap();
+        idx.index_session_turn("sess-A", "session://sess-A/item/1", "# T\n\nBravo.")
+            .unwrap();
+        idx.index_session_turn("sess-A", "session://sess-A/item/2", "# T\n\nCharlie.")
+            .unwrap();
+        idx.index_session_turn("sess-B", "session://sess-B/item/0", "# T\n\nDelta.")
+            .unwrap();
+
+        // Simulate a rewrite (e.g. compaction) that leaves only items 0 and 1.
+        let keep: std::collections::HashSet<String> = ["session://sess-A/item/0", "session://sess-A/item/1"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let removed = idx.prune_session_chunks_not_in("sess-A", &keep).unwrap();
+        assert_eq!(removed, 1, "only the orphaned item/2 chunk should be pruned");
+
+        // The pruned turn_ref is gone; kept refs and the other session survive.
+        assert!(idx.get_chunks_for_path("session://sess-A/item/2").unwrap().is_empty());
+        assert!(!idx.get_chunks_for_path("session://sess-A/item/0").unwrap().is_empty());
+        assert!(!idx.get_chunks_for_path("session://sess-A/item/1").unwrap().is_empty());
+        assert!(
+            !idx.get_chunks_for_path("session://sess-B/item/0").unwrap().is_empty(),
+            "prune must be scoped to the target session",
+        );
+
+        // A no-op prune (everything present) removes nothing.
+        let keep_all: std::collections::HashSet<String> =
+            ["session://sess-A/item/0", "session://sess-A/item/1"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(idx.prune_session_chunks_not_in("sess-A", &keep_all).unwrap(), 0);
     }
 
     /// A pre-v2 database (chunks table with no `session_id` column) must open
