@@ -249,6 +249,17 @@ impl MemoryConfig {
             result.context_mode = ContextMode::Compact;
         }
 
+        // `Full` (replay the entire transcript, no compaction) is accepted by
+        // the CLI/env/TOML but its runtime enforcement is not yet implemented —
+        // it currently behaves like `Compact`. Warn so the gap is visible rather
+        // than silently ignored, mirroring the recall fallback above.
+        if result.context_mode == ContextMode::Full {
+            tracing::warn!(
+                "context_mode=full is accepted but not yet enforced; \
+                 behaving as compact (threshold summarization still runs)"
+            );
+        }
+
         result
     }
 }

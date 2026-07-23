@@ -1693,19 +1693,32 @@ impl SessionActor {
         }
         let session_id = self.session_info.id.0.to_string();
 
-        // Index prior turns so recall reflects the whole conversation. Exclude
-        // the final *real* user item (the current query) so it cannot be
-        // retrieved as its own prior context. This must be the same turn the
-        // query was extracted from (`extract_last_real_user_query`), so use the
-        // shared `is_real_user_turn` predicate rather than the last raw `User`:
-        // a trailing synthetic user item (e.g. a system reminder) would
-        // otherwise leave the real query indexable. Idempotent: unchanged turns
-        // are skipped.
+        // Index prior turns so recall reflects the conversation. Exclude the
+        // final *real* user item (the current query) so it cannot be retrieved
+        // as its own prior context. This must be the same turn the query was
+        // extracted from (`extract_last_real_user_query`), so use the shared
+        // `is_real_user_turn` predicate rather than the last raw `User`: a
+        // trailing synthetic user item (e.g. a system reminder) would otherwise
+        // leave the real query indexable.
         let last_real_user_pos = conversation
             .iter()
             .rposition(crate::session::helpers::session_compact::is_real_user_turn);
+
+        // Incremental indexing. `recall_index_cursor` is the item index up to
+        // which prior turns were already synced. Because recall mode suppresses
+        // compaction, stored history is append-only on the common path, so we
+        // index only items[start..] — making per-turn work O(new items) rather
+        // than O(session length) (the whole point of the mode). If the
+        // conversation shrank, the cursor is stale (a rewind/rewrite): reset to
+        // 0 for a full rescan. A full scan (`start == 0`, also the first turn of
+        // a resumed process) is the only time `indexed_refs` is complete, so it
+        // is also the only time we prune orphaned turn_refs — on the append-only
+        // path nothing is ever orphaned, and a full prune scan every turn would
+        // reintroduce the O(session length) cost we are removing here.
+        let prev_cursor = self.memory.recall_index_cursor.get();
+        let (start, full_scan) = recall_index_start(prev_cursor, conversation.len());
         let mut indexed_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (idx, item) in conversation.iter().enumerate() {
+        for (idx, item) in conversation.iter().enumerate().skip(start) {
             if Some(idx) == last_real_user_pos {
                 continue;
             }
@@ -1726,20 +1739,27 @@ impl SessionActor {
                     "RECALL: failed to index session turn"
                 );
             }
-            indexed_refs.insert(turn_ref);
+            if full_scan {
+                indexed_refs.insert(turn_ref);
+            }
         }
 
-        // Drop session chunks whose positional turn_ref is no longer present —
-        // compaction/rewind rewrites the conversation and shifts item indices,
-        // orphaning old `session://{id}/item/N` paths that would otherwise stay
-        // searchable for this session forever.
-        if let Err(e) = index.prune_session_chunks_not_in(&session_id, &indexed_refs) {
+        if full_scan
+            && let Err(e) = index.prune_session_chunks_not_in(&session_id, &indexed_refs)
+        {
             tracing::warn!(
                 target: xai_grok_telemetry::memory_log::TARGET,
                 error = %e,
                 "RECALL: failed to prune orphaned session chunks"
             );
         }
+
+        // Advance the cursor to the excluded current-query position: next turn
+        // re-scans from there, so the query (no longer the latest real user) and
+        // everything appended after it get indexed exactly once.
+        self.memory
+            .recall_index_cursor
+            .set(last_real_user_pos.unwrap_or(conversation.len()));
 
         // Embed newly written chunks (best effort) so the vector pass can match;
         // FTS-only recall still works without an embedding provider.
@@ -2624,6 +2644,51 @@ mod auth_retry_schedule_tests {
         schedule.next_delay();
         schedule.reset();
         assert_eq!(schedule.next_delay(), Some((1, Duration::from_secs(1))));
+    }
+}
+/// Decide where recall incremental indexing should (re)start.
+///
+/// Returns `(start, full_scan)`: `start` is the first conversation index to
+/// (re)index this turn, and `full_scan` is true when the entire conversation is
+/// scanned — the first pass of a (re)started process (`prev_cursor == 0`) or a
+/// reset after the conversation shrank (`prev_cursor > len`, i.e. a
+/// rewind/rewrite left the cursor stale). A full scan is the only time the
+/// collected turn_refs are complete, so it is the only time orphan pruning is
+/// valid; on the append-only incremental path nothing is orphaned.
+fn recall_index_start(prev_cursor: usize, conversation_len: usize) -> (usize, bool) {
+    let start = if prev_cursor > conversation_len {
+        0
+    } else {
+        prev_cursor
+    };
+    (start, start == 0)
+}
+#[cfg(test)]
+mod recall_index_start_tests {
+    use super::recall_index_start;
+
+    #[test]
+    fn first_pass_is_full_scan() {
+        // Fresh cursor (0) scans everything and enables pruning.
+        assert_eq!(recall_index_start(0, 10), (0, true));
+    }
+
+    #[test]
+    fn steady_incremental_resumes_from_cursor() {
+        // Cursor mid-conversation: index only the appended tail, no prune.
+        assert_eq!(recall_index_start(6, 10), (6, false));
+    }
+
+    #[test]
+    fn cursor_at_end_indexes_nothing_new() {
+        // start == len: the skip(start) loop yields no items; not a full scan.
+        assert_eq!(recall_index_start(10, 10), (10, false));
+    }
+
+    #[test]
+    fn shrink_resets_to_full_scan() {
+        // Conversation shorter than the cursor (rewind/rewrite): reset + prune.
+        assert_eq!(recall_index_start(12, 8), (0, true));
     }
 }
 #[cfg(test)]

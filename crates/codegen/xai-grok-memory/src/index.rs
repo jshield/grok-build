@@ -439,19 +439,13 @@ impl MemoryIndex {
                         "INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?1, ?2)",
                         params![old.rowid, old.text],
                     )?;
-                    let new_rowid: Option<i64> = tx
-                        .query_row(
-                            "SELECT rowid FROM chunks WHERE id = ?1",
-                            params![chunk_id],
-                            |row| row.get(0),
-                        )
-                        .ok();
-                    if let Some(rid) = new_rowid {
-                        tx.execute(
-                            "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
-                            params![rid, chunk.text],
-                        )?;
-                    }
+                    // An UPDATE never changes a row's rowid (the rowid column is
+                    // untouched), so the FTS row re-inserts under the same rowid
+                    // we just deleted — no need to re-SELECT it.
+                    tx.execute(
+                        "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
+                        params![old.rowid, chunk.text],
+                    )?;
                     if self.vec_available {
                         let _ = tx.execute(
                             "DELETE FROM chunks_vec WHERE chunk_id = ?1",

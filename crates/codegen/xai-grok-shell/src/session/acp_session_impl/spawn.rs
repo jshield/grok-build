@@ -1470,6 +1470,7 @@ pub(crate) async fn spawn_session_actor(
                 .as_ref()
                 .filter(|mc| mc.enabled && mc.context_mode.is_recall())
                 .map(|mc| mc.recall.clone()),
+            recall_index_cursor: std::cell::Cell::new(0),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             flush_count: std::sync::atomic::AtomicU64::new(0),
             last_flush_content: std::cell::RefCell::new(None),
