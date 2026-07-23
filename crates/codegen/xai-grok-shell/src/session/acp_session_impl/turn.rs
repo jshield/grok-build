@@ -1666,6 +1666,126 @@ impl SessionActor {
             crate::session::helpers::memory_context::format_memory_reminder(&results)
         })
     }
+    /// Session-scoped recall for the experimental infinite-context mode.
+    ///
+    /// Syncs prior conversation turns into the session-scoped index (idempotent
+    /// hash-diff) and returns a transient `<prior_context>` block retrieved for
+    /// the latest user query, or `None` when nothing relevant is found. The
+    /// caller injects the block with `persist = false`, so it is recomputed
+    /// fresh each turn and never accumulates in the stored history.
+    ///
+    /// Best-effort: any failure (memory off, index open error, embed failure)
+    /// yields `None` and the turn proceeds without injection.
+    pub(crate) async fn recall_prior_context(
+        &self,
+        recall_cfg: &crate::config::RecallConfig,
+    ) -> Option<String> {
+        let storage = self.memory.storage()?;
+        let params = self.memory.backend_params.as_ref()?;
+        let mut index = self.memory.open_index(&storage)?;
+
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let query =
+            crate::session::helpers::session_compact::extract_last_real_user_query(&conversation)
+                .unwrap_or_default();
+        if query.is_empty() {
+            return None;
+        }
+        let session_id = self.session_info.id.0.to_string();
+
+        // Index prior turns so recall reflects the conversation. Exclude the
+        // final *real* user item (the current query) so it cannot be retrieved
+        // as its own prior context. This must be the same turn the query was
+        // extracted from (`extract_last_real_user_query`), so use the shared
+        // `is_real_user_turn` predicate rather than the last raw `User`: a
+        // trailing synthetic user item (e.g. a system reminder) would otherwise
+        // leave the real query indexable.
+        let last_real_user_pos = conversation
+            .iter()
+            .rposition(crate::session::helpers::session_compact::is_real_user_turn);
+
+        // Incremental indexing. `recall_index_cursor` is the item index up to
+        // which prior turns were already synced. Because recall mode suppresses
+        // compaction, stored history is append-only on the common path, so we
+        // index only items[start..] — making per-turn work O(new items) rather
+        // than O(session length) (the whole point of the mode). If the
+        // conversation shrank, the cursor is stale (a rewind/rewrite): reset to
+        // 0 for a full rescan. A full scan (`start == 0`, also the first turn of
+        // a resumed process) is the only time `indexed_refs` is complete, so it
+        // is also the only time we prune orphaned turn_refs — on the append-only
+        // path nothing is ever orphaned, and a full prune scan every turn would
+        // reintroduce the O(session length) cost we are removing here.
+        let prev_cursor = self.memory.recall_index_cursor.get();
+        let (start, full_scan) = recall_index_start(prev_cursor, conversation.len());
+        let mut indexed_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (idx, item) in conversation.iter().enumerate().skip(start) {
+            if Some(idx) == last_real_user_pos {
+                continue;
+            }
+            let text = match item {
+                ConversationItem::User(u) if u.synthetic_reason.is_none() => item.text_content(),
+                ConversationItem::Assistant(_) => item.text_content(),
+                _ => continue,
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let turn_ref = format!("session://{session_id}/item/{idx}");
+            if let Err(e) = index.index_session_turn(&session_id, &turn_ref, text) {
+                tracing::warn!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    error = %e,
+                    "RECALL: failed to index session turn"
+                );
+            }
+            if full_scan {
+                indexed_refs.insert(turn_ref);
+            }
+        }
+
+        if full_scan
+            && let Err(e) = index.prune_session_chunks_not_in(&session_id, &indexed_refs)
+        {
+            tracing::warn!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                error = %e,
+                "RECALL: failed to prune orphaned session chunks"
+            );
+        }
+
+        // Advance the cursor to the excluded current-query position: next turn
+        // re-scans from there, so the query (no longer the latest real user) and
+        // everything appended after it get indexed exactly once.
+        self.memory
+            .recall_index_cursor
+            .set(last_real_user_pos.unwrap_or(conversation.len()));
+
+        // Embed newly written chunks (best effort) so the vector pass can match;
+        // FTS-only recall still works without an embedding provider.
+        let provider = params.make_embedding_provider().await;
+        if let Some(ref p) = provider {
+            crate::session::memory::embed_missing_chunks(&index, p).await;
+        }
+        let provider_dyn = provider
+            .as_ref()
+            .map(|p| p as &dyn crate::session::memory::embedding::EmbeddingProvider);
+        let results =
+            crate::session::memory::session_recall(&index, provider_dyn, &query, &session_id, recall_cfg)
+                .await
+                .ok()?;
+
+        let block = crate::session::memory::assemble_prior_context(&results);
+        if block.is_empty() {
+            return None;
+        }
+        tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            results = results.len(),
+            "RECALL: injected prior_context block"
+        );
+        Some(block)
+    }
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's
     /// next step, pushing the call's `tool_result` (correction / retry error /
     /// terminal) as a side effect. Validates the args against `validator` and
@@ -1907,14 +2027,37 @@ impl SessionActor {
             self.drain_pending_interjections().await;
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
-            let memory_reminder = self.first_turn_memory_reminder().await;
+            // Context injection. Recall mode (experimental infinite-context)
+            // composes both memory paths: on the first turn it injects the
+            // one-shot cross-session memory reminder (persisted into the system
+            // message, exactly like compact mode) so project/global MEMORY.md is
+            // not lost on long sessions; from then on it injects per-turn
+            // session-scoped prior_context transiently (`persist = false`,
+            // recomputed each turn). `first_turn_memory_reminder` self-gates via
+            // the `context_injected` latch, so checking it here selects turn 1
+            // vs. the rest. Non-recall mode keeps the original behavior.
+            let recall_active = self.memory.recall_mode.is_some();
+            let first_turn_pending = !self
+                .memory
+                .context_injected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let (memory_reminder, persist_memory_reminder) = match self.memory.recall_mode.clone() {
+                Some(recall_cfg) if !first_turn_pending => {
+                    (self.recall_prior_context(&recall_cfg).await, false)
+                }
+                _ => (
+                    self.first_turn_memory_reminder().await,
+                    self.memory.is_enabled(),
+                ),
+            };
             if memory_reminder.is_some() {
                 self.memory
                     .injection_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
                     target : xai_grok_telemetry::memory_log::TARGET,
-                    "MEMORY_INJECT: first-turn memory context injected"
+                    recall = recall_active,
+                    "MEMORY_INJECT: context injected"
                 );
             }
             self.maybe_inject_mcp_reminder().await;
@@ -1962,7 +2105,7 @@ impl SessionActor {
                 .build_request(
                     effective_tools,
                     memory_reminder,
-                    self.memory.is_enabled(),
+                    persist_memory_reminder,
                     trace_gcs_config
                         .clone()
                         .map(|cfg| -> Box<dyn crate::sampling::TraceContext> {
@@ -2501,6 +2644,51 @@ mod auth_retry_schedule_tests {
         schedule.next_delay();
         schedule.reset();
         assert_eq!(schedule.next_delay(), Some((1, Duration::from_secs(1))));
+    }
+}
+/// Decide where recall incremental indexing should (re)start.
+///
+/// Returns `(start, full_scan)`: `start` is the first conversation index to
+/// (re)index this turn, and `full_scan` is true when the entire conversation is
+/// scanned — the first pass of a (re)started process (`prev_cursor == 0`) or a
+/// reset after the conversation shrank (`prev_cursor > len`, i.e. a
+/// rewind/rewrite left the cursor stale). A full scan is the only time the
+/// collected turn_refs are complete, so it is the only time orphan pruning is
+/// valid; on the append-only incremental path nothing is orphaned.
+fn recall_index_start(prev_cursor: usize, conversation_len: usize) -> (usize, bool) {
+    let start = if prev_cursor > conversation_len {
+        0
+    } else {
+        prev_cursor
+    };
+    (start, start == 0)
+}
+#[cfg(test)]
+mod recall_index_start_tests {
+    use super::recall_index_start;
+
+    #[test]
+    fn first_pass_is_full_scan() {
+        // Fresh cursor (0) scans everything and enables pruning.
+        assert_eq!(recall_index_start(0, 10), (0, true));
+    }
+
+    #[test]
+    fn steady_incremental_resumes_from_cursor() {
+        // Cursor mid-conversation: index only the appended tail, no prune.
+        assert_eq!(recall_index_start(6, 10), (6, false));
+    }
+
+    #[test]
+    fn cursor_at_end_indexes_nothing_new() {
+        // start == len: the skip(start) loop yields no items; not a full scan.
+        assert_eq!(recall_index_start(10, 10), (10, false));
+    }
+
+    #[test]
+    fn shrink_resets_to_full_scan() {
+        // Conversation shorter than the cursor (rewind/rewrite): reset + prune.
+        assert_eq!(recall_index_start(12, 8), (0, true));
     }
 }
 #[cfg(test)]

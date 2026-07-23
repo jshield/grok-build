@@ -61,6 +61,10 @@ pub struct ChunkRecord {
     pub source: String,
     pub access_count: i64,
     pub created_at: i64,
+    /// Session that owns this chunk, or `None` for workspace/global-tier
+    /// chunks that are shared across all sessions. Set only for chunks written
+    /// via [`MemoryIndex::index_session_turn`] for session-scoped recall.
+    pub session_id: Option<String>,
 }
 
 /// Result of a FTS5 keyword search.
@@ -148,6 +152,12 @@ impl MemoryIndex {
         // Create schema
         db.execute_batch(&schema::schema_sql(dimensions, vec_available))?;
 
+        // v1→v2 additive migration: pre-existing databases created before the
+        // `session_id` column existed keep their `chunks` table (CREATE TABLE
+        // IF NOT EXISTS is a no-op for them), so add the column out-of-band.
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so gate on table_info.
+        Self::migrate_add_session_id(&db)?;
+
         // Store/verify embedding dimensions in meta table
         let stored_dims: Option<String> = db
             .query_row(schema::GET_META_SQL, params!["embedding_dimensions"], |r| {
@@ -195,6 +205,23 @@ impl MemoryIndex {
             vec_available,
             embedding_dimensions: dimensions,
         })
+    }
+
+    /// Add the `chunks.session_id` column to a pre-v2 database if it is
+    /// missing. Idempotent: on a freshly created (v2) schema the column already
+    /// exists and this is a no-op.
+    fn migrate_add_session_id(db: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        let has_column = db
+            .prepare("SELECT 1 FROM pragma_table_info('chunks') WHERE name = 'session_id'")?
+            .exists([])?;
+        if !has_column {
+            db.execute(schema::ADD_SESSION_ID_COLUMN_SQL, [])?;
+            tracing::info!("memory index: migrated chunks table with session_id column");
+        }
+        // Index creation is `IF NOT EXISTS`, so it is safe on both paths and
+        // covers a database that gained the column but not the index.
+        db.execute(schema::CREATE_SESSION_INDEX_SQL, [])?;
+        Ok(())
     }
 
     /// Whether sqlite-vec is available for vector operations.
@@ -350,6 +377,182 @@ impl MemoryIndex {
         Ok(result)
     }
 
+    /// Index a single conversation turn into the session-scoped tier.
+    ///
+    /// Unlike [`reindex_file`](Self::reindex_file) (which indexes on-disk memory
+    /// files as workspace/global chunks with `session_id = NULL`), this writes
+    /// chunks tagged with `session_id` so [`crate::session_recall`] can retrieve
+    /// only the current conversation's history. `turn_ref` is a caller-supplied
+    /// stable identifier for the turn (used as the chunk `path` and the basis of
+    /// chunk ids); it should be unique per turn within a session, e.g.
+    /// `format!("session://{session_id}/turn/{turn_index}")`.
+    ///
+    /// Chunks are inserted with `source = "session"`, so the existing temporal
+    /// decay and source-weighting logic applies unchanged. Embeddings are filled
+    /// in lazily by [`crate::embed_missing_chunks`], the same as file chunks.
+    ///
+    /// Returns the number of chunks written. Re-indexing the same `turn_ref` is
+    /// idempotent: unchanged chunks are skipped, changed ones updated, and
+    /// chunks that disappeared from the turn are removed — mirroring
+    /// `reindex_file`'s hash-diffing behavior.
+    pub fn index_session_turn(
+        &mut self,
+        session_id: &str,
+        turn_ref: &str,
+        text: &str,
+    ) -> Result<ReindexResult, rusqlite::Error> {
+        let new_chunks = chunk_markdown(text, &self.chunk_config);
+        let existing = self.get_chunks_for_path(turn_ref)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let mut result = ReindexResult::default();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        let tx = self.db.transaction()?;
+
+        for (i, chunk) in new_chunks.iter().enumerate() {
+            let chunk_id = format!("{turn_ref}:{i}");
+            let hash = chunk_hash(&chunk.text);
+            seen_ids.insert(chunk_id.clone());
+
+            match existing.get(&chunk_id) {
+                Some(old) if old.hash == hash => {}
+                Some(old) => {
+                    tx.execute(
+                        "UPDATE chunks SET text = ?1, hash = ?2, start_line = ?3, \
+                         end_line = ?4, updated_at = ?5, session_id = ?6 WHERE id = ?7",
+                        params![
+                            chunk.text,
+                            hash,
+                            chunk.start_line,
+                            chunk.end_line,
+                            now,
+                            session_id,
+                            chunk_id
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?1, ?2)",
+                        params![old.rowid, old.text],
+                    )?;
+                    // An UPDATE never changes a row's rowid (the rowid column is
+                    // untouched), so the FTS row re-inserts under the same rowid
+                    // we just deleted — no need to re-SELECT it.
+                    tx.execute(
+                        "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
+                        params![old.rowid, chunk.text],
+                    )?;
+                    if self.vec_available {
+                        let _ = tx.execute(
+                            "DELETE FROM chunks_vec WHERE chunk_id = ?1",
+                            params![chunk_id],
+                        );
+                    }
+                    result.updated += 1;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO chunks (id, path, start_line, end_line, text, hash, source, \
+                         created_at, updated_at, session_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'session', ?7, ?7, ?8)",
+                        params![
+                            chunk_id,
+                            turn_ref,
+                            chunk.start_line,
+                            chunk.end_line,
+                            chunk.text,
+                            hash,
+                            now,
+                            session_id,
+                        ],
+                    )?;
+                    let rowid = tx.last_insert_rowid();
+                    tx.execute(
+                        "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
+                        params![rowid, chunk.text],
+                    )?;
+                    result.added += 1;
+                }
+            }
+        }
+
+        for (old_id, old_record) in &existing {
+            if !seen_ids.contains(old_id) {
+                tx.execute(
+                    "INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?1, ?2)",
+                    params![old_record.rowid, old_record.text],
+                )?;
+                if self.vec_available {
+                    let _ = tx.execute(
+                        "DELETE FROM chunks_vec WHERE chunk_id = ?1",
+                        params![old_id],
+                    );
+                }
+                tx.execute("DELETE FROM chunks WHERE id = ?1", params![old_id])?;
+                result.removed += 1;
+            }
+        }
+
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Delete session-scoped chunks for `session_id` whose owning `path`
+    /// (turn_ref) is not in `keep_refs`.
+    ///
+    /// [`index_session_turn`](Self::index_session_turn) keeps a single turn_ref
+    /// in sync, but positional turn_refs (`session://{id}/item/{idx}`) are
+    /// orphaned when the conversation is rewritten — compaction collapses turns
+    /// into a summary, rewind drops the tail — leaving high-index paths
+    /// searchable forever. Callers pass the set of turn_refs present in the
+    /// current conversation; everything else for this session is removed,
+    /// bounding index growth. Returns the number of chunks deleted.
+    pub fn prune_session_chunks_not_in(
+        &mut self,
+        session_id: &str,
+        keep_refs: &std::collections::HashSet<String>,
+    ) -> Result<usize, rusqlite::Error> {
+        // Collect first (can't hold the statement borrow across the deletes).
+        let stale: Vec<(String, i64, String)> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT id, rowid, text, path FROM chunks WHERE session_id = ?1")?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, // id
+                    row.get::<_, i64>(1)?,     // rowid
+                    row.get::<_, String>(2)?,  // text (for contentless FTS delete)
+                    row.get::<_, String>(3)?,  // path (turn_ref)
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, _, _, path)| !keep_refs.contains(path))
+                .map(|(id, rowid, text, _)| (id, rowid, text))
+                .collect()
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.db.transaction()?;
+        for (id, rowid, text) in &stale {
+            tx.execute(
+                "INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?1, ?2)",
+                params![rowid, text],
+            )?;
+            if self.vec_available {
+                let _ = tx.execute("DELETE FROM chunks_vec WHERE chunk_id = ?1", params![id]);
+            }
+            tx.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(stale.len())
+    }
+
     // -----------------------------------------------------------------------
     // Search
     // -----------------------------------------------------------------------
@@ -405,6 +608,38 @@ impl MemoryIndex {
         self.resolve_fts_rowids(rows)
     }
 
+    /// FTS5 keyword search restricted to a single session's chunks.
+    ///
+    /// Joins `chunks_fts` back to `chunks` and filters on `session_id`, the
+    /// session-scoped analog of [`search_fts_by_sources`](Self::search_fts_by_sources)
+    /// (which filters on `source`). Used by [`crate::session_recall`].
+    pub fn search_fts_by_session(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: &str,
+    ) -> Result<Vec<FtsResult>, rusqlite::Error> {
+        let keywords = super::query_expansion::extract_keywords(query);
+        let fts_query = keywords.join(" OR ");
+        if fts_query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut stmt = self.db.prepare(
+            "SELECT f.rowid, f.rank FROM chunks_fts f \
+             JOIN chunks c ON f.rowid = c.rowid \
+             WHERE chunks_fts MATCH ?1 AND c.session_id = ?3 \
+             ORDER BY f.rank LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![fts_query, limit as i64, session_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.resolve_fts_rowids(rows)
+    }
+
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>, rusqlite::Error> {
         let keywords = super::query_expansion::extract_keywords(query);
         let fts_query = keywords.join(" OR ");
@@ -447,7 +682,7 @@ impl MemoryIndex {
     pub fn get_chunk(&self, id: &str) -> Result<Option<ChunkRecord>, rusqlite::Error> {
         let mut stmt = self.db.prepare(
             "SELECT rowid, id, path, start_line, end_line, text, hash, source, access_count, \
-             created_at FROM chunks WHERE id = ?1",
+             created_at, session_id FROM chunks WHERE id = ?1",
         )?;
         let result = stmt
             .query_row(params![id], |row| {
@@ -462,6 +697,7 @@ impl MemoryIndex {
                     source: row.get(7)?,
                     access_count: row.get(8)?,
                     created_at: row.get(9)?,
+                    session_id: row.get(10)?,
                 })
             })
             .ok();
@@ -669,7 +905,7 @@ impl MemoryIndex {
     ) -> Result<HashMap<String, ChunkRecord>, rusqlite::Error> {
         let mut stmt = self.db.prepare(
             "SELECT rowid, id, path, start_line, end_line, text, hash, source, access_count, \
-             created_at FROM chunks WHERE path = ?1",
+             created_at, session_id FROM chunks WHERE path = ?1",
         )?;
         let rows = stmt.query_map(params![path], |row| {
             Ok(ChunkRecord {
@@ -683,6 +919,7 @@ impl MemoryIndex {
                 source: row.get(7)?,
                 access_count: row.get(8)?,
                 created_at: row.get(9)?,
+                session_id: row.get(10)?,
             })
         })?;
         let mut map = HashMap::new();
@@ -758,6 +995,111 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let idx = test_index(&tmp);
         assert_eq!(idx.embedding_dimensions(), 1536);
+    }
+
+    #[test]
+    fn prune_session_chunks_removes_orphaned_turn_refs() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = test_index(&tmp);
+
+        // Three turns for one session, plus a chunk in a different session that
+        // must never be touched by a scoped prune.
+        idx.index_session_turn("sess-A", "session://sess-A/item/0", "# T\n\nAlpha.")
+            .unwrap();
+        idx.index_session_turn("sess-A", "session://sess-A/item/1", "# T\n\nBravo.")
+            .unwrap();
+        idx.index_session_turn("sess-A", "session://sess-A/item/2", "# T\n\nCharlie.")
+            .unwrap();
+        idx.index_session_turn("sess-B", "session://sess-B/item/0", "# T\n\nDelta.")
+            .unwrap();
+
+        // Simulate a rewrite (e.g. compaction) that leaves only items 0 and 1.
+        let keep: std::collections::HashSet<String> = ["session://sess-A/item/0", "session://sess-A/item/1"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let removed = idx.prune_session_chunks_not_in("sess-A", &keep).unwrap();
+        assert_eq!(removed, 1, "only the orphaned item/2 chunk should be pruned");
+
+        // The pruned turn_ref is gone; kept refs and the other session survive.
+        assert!(idx.get_chunks_for_path("session://sess-A/item/2").unwrap().is_empty());
+        assert!(!idx.get_chunks_for_path("session://sess-A/item/0").unwrap().is_empty());
+        assert!(!idx.get_chunks_for_path("session://sess-A/item/1").unwrap().is_empty());
+        assert!(
+            !idx.get_chunks_for_path("session://sess-B/item/0").unwrap().is_empty(),
+            "prune must be scoped to the target session",
+        );
+
+        // A no-op prune (everything present) removes nothing.
+        let keep_all: std::collections::HashSet<String> =
+            ["session://sess-A/item/0", "session://sess-A/item/1"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(idx.prune_session_chunks_not_in("sess-A", &keep_all).unwrap(), 0);
+    }
+
+    /// A pre-v2 database (chunks table with no `session_id` column) must open
+    /// cleanly: the additive migration adds the column, leaves existing rows
+    /// with `session_id = NULL`, and session-scoped writes work afterward.
+    #[test]
+    fn test_v1_to_v2_migration_adds_session_id() {
+        init_sqlite_vec();
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy.sqlite");
+
+        // Hand-build the v1 schema (no session_id column) + one legacy row.
+        {
+            let db = rusqlite::Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE chunks (
+                    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT UNIQUE NOT NULL,
+                    path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed INTEGER
+                );
+                CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='');
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO chunks (id, path, start_line, end_line, text, hash, source, \
+                 created_at, updated_at) VALUES ('legacy:0', 'old.md', 0, 1, 'legacy text', \
+                 'h', 'workspace', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening through MemoryIndex must migrate in place, not error.
+        let mut idx = MemoryIndex::open_or_create(
+            &db_path,
+            test_storage(&tmp),
+            MemoryIndexConfig::default(),
+            1536,
+        )
+        .unwrap();
+
+        // The legacy row survives and reads back with session_id = None.
+        let legacy = idx.get_chunk("legacy:0").unwrap().unwrap();
+        assert_eq!(legacy.text, "legacy text");
+        assert_eq!(legacy.session_id, None);
+
+        // Session-scoped writes work on the migrated database.
+        idx.index_session_turn("sess-A", "session://sess-A/turn/1", "# T\n\nnew session note")
+            .unwrap();
+        let fts = idx
+            .search_fts_by_session("session note", 10, "sess-A")
+            .unwrap();
+        assert!(!fts.is_empty(), "session-scoped FTS must work post-migration");
     }
 
     #[test]

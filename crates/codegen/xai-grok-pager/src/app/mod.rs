@@ -589,6 +589,15 @@ pub async fn run(
         args.permission_mode_flag.as_deref(),
         remote_permission_mode,
     );
+    // Surface the experimental context-mode CLI flag to the config layer via
+    // the same GROK_CONTEXT_MODE env var it already reads (highest precedence).
+    // Set here — before `connect()` resolves MemoryConfig — so it also survives
+    // live config reloads, which re-read the env. Single-threaded at this point
+    // in startup (before the session actor / reloader spawn).
+    if let Some(mode) = args.context_mode.as_deref() {
+        // SAFETY: startup is single-threaded here; no other thread reads env yet.
+        unsafe { std::env::set_var(xai_grok_shell::config::ContextMode::ENV_VAR, mode) };
+    }
     let connect_flags = crate::acp::ConnectFlags {
         subagents: !args.no_subagents,
         experimental_memory: args.experimental_memory,

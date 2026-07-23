@@ -125,6 +125,8 @@ async fn create_test_actor(
             save_on_end: true,
             backend_params: None,
             initial_injection_config: Default::default(),
+            recall_mode: None,
+            recall_index_cursor: std::cell::Cell::new(0),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             flush_count: std::sync::atomic::AtomicU64::new(0),
             last_flush_content: std::cell::RefCell::new(None),
@@ -289,6 +291,33 @@ async fn test_check_auto_compact_needed_uses_state() {
             assert!(result.is_some(), "Should trigger at 90%");
             let info = result.unwrap();
             assert_eq!(info.percentage, 90);
+        })
+        .await;
+}
+/// Recall (infinite-context) mode suppresses threshold auto-compaction: the
+/// outgoing request is bounded by history truncation, not summarization, so a
+/// context level that would normally trigger a compact must be a no-op.
+#[tokio::test(flavor = "current_thread")]
+async fn recall_mode_suppresses_auto_compact() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor =
+                create_test_actor(90_000, 100_000, 85, gateway_tx, persistence_tx).await;
+            // Baseline: 90% of the window would normally trigger a compaction.
+            assert!(
+                actor.check_auto_compact_needed().await.is_some(),
+                "control: 90% should trigger without recall mode"
+            );
+            // Activating recall mode must suppress it.
+            actor.memory.recall_mode = Some(crate::config::RecallConfig::default());
+            assert!(
+                actor.check_auto_compact_needed().await.is_none(),
+                "recall mode must suppress threshold auto-compaction"
+            );
         })
         .await;
 }
@@ -562,6 +591,8 @@ async fn create_test_actor_with_memory(
             save_on_end: true,
             backend_params: None,
             initial_injection_config: memory_initial_injection_config,
+            recall_mode: None,
+            recall_index_cursor: std::cell::Cell::new(0),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             flush_count: std::sync::atomic::AtomicU64::new(0),
             last_flush_content: std::cell::RefCell::new(None),
@@ -1333,6 +1364,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     save_on_end: true,
                     backend_params: None,
                     initial_injection_config: Default::default(),
+                    recall_mode: None,
+                    recall_index_cursor: std::cell::Cell::new(0),
                     context_injected: std::sync::atomic::AtomicBool::new(false),
                     flush_count: std::sync::atomic::AtomicU64::new(0),
                     last_flush_content: std::cell::RefCell::new(None),

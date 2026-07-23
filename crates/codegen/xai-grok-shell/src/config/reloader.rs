@@ -873,24 +873,45 @@ ignore = ["/tmp"]
         assert_eq!(skills.ignore, vec!["/tmp".to_string()]);
     }
 
+    /// Clear `GROK_MEMORY` for the duration of `f`, serialized on the shared
+    /// env lock so a concurrent `GROK_MEMORY=0` test can't force both resolves
+    /// to `enabled = false` and collapse the diff. Restores the prior value.
+    fn without_grok_memory_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::config::MEMORY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("GROK_MEMORY").ok();
+        unsafe { std::env::remove_var("GROK_MEMORY") };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match previous {
+            Some(prev) => unsafe { std::env::set_var("GROK_MEMORY", prev) },
+            None => unsafe { std::env::remove_var("GROK_MEMORY") },
+        }
+        result.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
     #[test]
     fn memory_config_diff_detects_enabled_change() {
-        let empty = toml::Value::Table(toml::map::Map::new());
-        let enabled: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
+        without_grok_memory_env(|| {
+            let empty = toml::Value::Table(toml::map::Map::new());
+            let enabled: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
 
-        let old = crate::config::MemoryConfig::resolve(false, false, &empty, None);
-        let new = crate::config::MemoryConfig::resolve(false, false, &enabled, None);
-        assert_ne!(old, new, "should detect enabled field change");
+            let old = crate::config::MemoryConfig::resolve(false, false, &empty, None);
+            let new = crate::config::MemoryConfig::resolve(false, false, &enabled, None);
+            assert_ne!(old, new, "should detect enabled field change");
+        });
     }
 
     #[test]
     fn memory_config_diff_detects_search_param_change() {
-        let a: toml::Value = toml::from_str("[memory.search]\nmax_results = 6").unwrap();
-        let b: toml::Value = toml::from_str("[memory.search]\nmax_results = 10").unwrap();
+        without_grok_memory_env(|| {
+            let a: toml::Value = toml::from_str("[memory.search]\nmax_results = 6").unwrap();
+            let b: toml::Value = toml::from_str("[memory.search]\nmax_results = 10").unwrap();
 
-        let old = crate::config::MemoryConfig::resolve(false, false, &a, None);
-        let new = crate::config::MemoryConfig::resolve(false, false, &b, None);
-        assert_ne!(old, new, "should detect search param change");
+            let old = crate::config::MemoryConfig::resolve(false, false, &a, None);
+            let new = crate::config::MemoryConfig::resolve(false, false, &b, None);
+            assert_ne!(old, new, "should detect search param change");
+        });
     }
 
     #[test]

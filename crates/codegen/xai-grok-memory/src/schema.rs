@@ -8,9 +8,19 @@
 //! When sqlite-vec is available, a fourth table is created:
 //! - `chunks_vec` — vec0 virtual table for KNN vector search
 
-/// Schema version. Bump when making breaking schema changes that require
-/// dropping and recreating tables.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Schema version, for documentation and future use.
+///
+/// Note: this constant is currently informational only — nothing reads or
+/// writes a `schema_version` meta key, and migrations are driven by runtime
+/// introspection (`pragma_table_info`) rather than a stored version. Treat it
+/// as a changelog marker, not a migration gate, until a versioned migration
+/// path exists.
+///
+/// v2 added the nullable `chunks.session_id` column (+ `idx_chunks_session`)
+/// for session-scoped recall. It is applied additively via `ALTER TABLE` on
+/// pre-existing v1 databases (see [`ADD_SESSION_ID_COLUMN_SQL`]), so it does
+/// not force a drop/recreate.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Generate the SQL schema for the memory index.
 ///
@@ -40,7 +50,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     access_count INTEGER DEFAULT 0,
-    last_accessed INTEGER
+    last_accessed INTEGER,
+    session_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
@@ -69,6 +80,17 @@ pub const UPSERT_META_SQL: &str = "INSERT OR REPLACE INTO meta(key, value) VALUE
 /// SQL to query a meta value by key.
 pub const GET_META_SQL: &str = "SELECT value FROM meta WHERE key = ?1";
 
+/// Additive v1→v2 migration: add the nullable `session_id` column to an
+/// existing `chunks` table. Guarded by a `PRAGMA table_info` check on the
+/// open path, since SQLite has no `ADD COLUMN IF NOT EXISTS`. Existing rows
+/// get `session_id = NULL`, which the recall path treats as workspace-tier
+/// (not scoped to any single session).
+pub const ADD_SESSION_ID_COLUMN_SQL: &str = "ALTER TABLE chunks ADD COLUMN session_id TEXT";
+
+/// Companion index for [`ADD_SESSION_ID_COLUMN_SQL`] on the migration path.
+pub const CREATE_SESSION_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id)";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +103,23 @@ mod tests {
         assert!(!sql.contains("chunks_vec"));
         // Connection pragmas live on the open path, not in the schema batch.
         assert!(!sql.contains("PRAGMA"));
+    }
+
+    #[test]
+    fn test_schema_sql_has_session_column() {
+        // Fresh databases get the session_id column inline via CREATE TABLE.
+        // The index is created separately (on the open path, after the column
+        // is guaranteed) so it also covers migrated pre-v2 databases where
+        // CREATE TABLE IF NOT EXISTS is a no-op — hence NOT in the schema batch.
+        let sql = schema_sql(1024, true);
+        assert!(sql.contains("session_id TEXT"));
+        assert!(
+            !sql.contains("idx_chunks_session"),
+            "session index must be created on the open path, not the schema batch, \
+             so it does not run against a pre-v2 table before ALTER adds the column"
+        );
+        assert!(ADD_SESSION_ID_COLUMN_SQL.contains("session_id"));
+        assert!(CREATE_SESSION_INDEX_SQL.contains("idx_chunks_session"));
     }
 
     #[test]

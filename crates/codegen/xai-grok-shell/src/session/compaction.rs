@@ -1765,6 +1765,16 @@ impl SessionActor {
     /// (exact prior count + byte-estimate of items since last response) so
     /// tool results are accounted for. Returns `None` when `is_flushing`.
     pub(crate) async fn check_auto_compact_needed(&self) -> Option<AutoCompactTriggerInfo> {
+        // Recall (infinite-context) mode bounds the outgoing request via
+        // request-side history truncation (see `set_recall_truncation` /
+        // `truncate_for_recall`), so threshold summarization is neither needed
+        // nor wanted — compacting would rewrite stored history into a summary
+        // that then pollutes the session recall index. The error-triggered
+        // emergency path (`should_compact_on_error`) stays active as a backstop
+        // for a single oversized turn that truncation can't bound.
+        if self.memory.recall_mode.is_some() {
+            return None;
+        }
         if self
             .memory
             .is_flushing
@@ -1827,6 +1837,13 @@ impl SessionActor {
     /// Returns `Some` when tool call outputs have pushed the estimated token
     /// count past the context window, indicating pre-emptive compaction is needed.
     pub(crate) async fn check_preflight_overflow(&self) -> Option<AutoCompactTriggerInfo> {
+        // In recall mode the estimate is over the full *stored* history (which
+        // grows unbounded by design), but the actual request is truncated to the
+        // last N turns — so this would fire on every turn once history exceeds
+        // the window. Truncation, not compaction, bounds the real request.
+        if self.memory.recall_mode.is_some() {
+            return None;
+        }
         if self
             .compaction
             .auto_compact_suppressed
@@ -1860,6 +1877,13 @@ impl SessionActor {
     /// (credit/auth → `SUPPRESS_UNTIL_SUCCESS`) is left intact — a switch can't
     /// restore credits or fix auth — and short-circuits the compaction.
     pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) {
+        // Recall mode never summarizes stored history (truncation bounds the
+        // request instead); a model switch still clears the stale-model marker
+        // but must not trigger a compaction rewrite.
+        if self.memory.recall_mode.is_some() {
+            self.compaction.previous_model.take();
+            return;
+        }
         let Some(prev) = self.compaction.previous_model.take() else {
             return;
         };
@@ -2255,6 +2279,8 @@ mod inline_auto_compact_flow_tests {
                 save_on_end: true,
                 backend_params: None,
                 initial_injection_config: Default::default(),
+                recall_mode: None,
+                recall_index_cursor: std::cell::Cell::new(0),
                 context_injected: std::sync::atomic::AtomicBool::new(false),
                 flush_count: std::sync::atomic::AtomicU64::new(0),
                 last_flush_content: std::cell::RefCell::new(None),
@@ -3062,6 +3088,8 @@ mod inline_auto_compact_flow_tests {
             save_on_end: true,
             backend_params: None,
             initial_injection_config: memory_initial_injection_config,
+            recall_mode: None,
+            recall_index_cursor: std::cell::Cell::new(0),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             flush_count: std::sync::atomic::AtomicU64::new(0),
             last_flush_content: std::cell::RefCell::new(None),

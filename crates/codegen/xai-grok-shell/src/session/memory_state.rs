@@ -19,6 +19,21 @@ pub struct SessionMemory {
     pub backend_params: Option<crate::session::memory::MemoryBackendParams>,
     /// First-turn memory injection behavior resolved from local + remote config.
     pub initial_injection_config: crate::config::MemoryInitialInjectionConfig,
+    /// When `Some`, session-scoped recall (the experimental "infinite context"
+    /// mode) is active, and the value carries its tuning. `None` when
+    /// `context_mode` is `compact`/`full` or memory is disabled. Set only when
+    /// `context_mode = recall` AND memory is enabled — the recall index lives
+    /// under the memory workspace, so recall requires memory. Gated behind the
+    /// `--context-mode recall` flag / `GROK_CONTEXT_MODE=recall`.
+    pub recall_mode: Option<crate::config::RecallConfig>,
+    /// Incremental session-recall index cursor: the conversation item index up to
+    /// which prior turns have already been synced into the session-scoped index.
+    /// Lets `recall_prior_context` index only newly-appended turns each turn
+    /// instead of rescanning the whole conversation (which is O(n²) over a
+    /// session). `RefCell`/`Cell` because the actor is single-threaded
+    /// (`LocalSet`). Reset to 0 when the conversation shrinks (a rewrite), which
+    /// triggers a full reindex + orphan prune that turn.
+    pub recall_index_cursor: std::cell::Cell<usize>,
     /// Per-process latch: the first-turn injection decision already ran in
     /// this session segment. Cross-segment idempotency comes from
     /// `conversation_has_memory_context`, not this flag.

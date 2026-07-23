@@ -92,9 +92,10 @@ command = "$$HOME"
     let command = test.get("command").and_then(|v| v.as_str()).unwrap();
     assert_eq!(command, "$HOME");
 }
-/// Mutex to serialize tests that touch the GROK_MEMORY env var.
-/// Env vars are process-global, so parallel tests race on them.
-static MEMORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes tests that touch the GROK_MEMORY / GROK_CONTEXT_MODE env vars.
+/// Shared with `config::reloader::tests` (env vars are process-global, so tests
+/// across modules race on them) — see [`crate::config::MEMORY_ENV_LOCK`].
+use crate::config::MEMORY_ENV_LOCK;
 /// Run `f` with `name` set to `value` (Some) or removed (None).
 /// Saves and restores the previous value, even on panic.
 fn with_env_var_opt<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
@@ -119,6 +120,15 @@ fn without_grok_memory<T>(f: impl FnOnce() -> T) -> T {
 fn with_grok_memory<T>(value: &str, f: impl FnOnce() -> T) -> T {
     let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_env_var_opt("GROK_MEMORY", Some(value), f)
+}
+/// Run `f` with GROK_CONTEXT_MODE set/unset and GROK_MEMORY unset, serialized
+/// on the shared lock (both env vars are process-global). Memory enablement is
+/// controlled via the `experimental_memory` argument to `resolve` instead.
+fn with_context_mode_env<T>(context_mode: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    with_env_var_opt("GROK_MEMORY", None, move || {
+        with_env_var_opt("GROK_CONTEXT_MODE", context_mode, f)
+    })
 }
 #[test]
 fn memory_config_default_disabled() {
@@ -195,6 +205,67 @@ fn memory_config_env_var_false_does_not_enable() {
             assert!(! mem.enabled, "GROK_MEMORY=false should not enable memory");
         },
     );
+}
+#[test]
+fn context_mode_defaults_to_compact() {
+    with_context_mode_env(None, || {
+        let config = toml::Value::Table(toml::map::Map::new());
+        let mem = MemoryConfig::resolve(true, false, &config, None);
+        assert_eq!(mem.context_mode, ContextMode::Compact);
+    });
+}
+#[test]
+fn context_mode_from_toml_recall() {
+    with_context_mode_env(None, || {
+        let config: toml::Value =
+            toml::from_str("[memory]\nenabled = true\ncontext_mode = \"recall\"").unwrap();
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        assert!(mem.enabled);
+        assert_eq!(mem.context_mode, ContextMode::Recall);
+    });
+}
+#[test]
+fn context_mode_env_overrides_toml() {
+    with_context_mode_env(Some("recall"), || {
+        // TOML says compact; env says recall → env wins.
+        let config: toml::Value =
+            toml::from_str("[memory]\nenabled = true\ncontext_mode = \"compact\"").unwrap();
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        assert_eq!(mem.context_mode, ContextMode::Recall);
+    });
+}
+#[test]
+fn context_mode_recall_without_memory_falls_back_to_compact() {
+    with_context_mode_env(Some("recall"), || {
+        // Recall requested but memory not enabled → guard demotes to compact.
+        let config = toml::Value::Table(toml::map::Map::new());
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        assert!(!mem.enabled);
+        assert_eq!(
+            mem.context_mode,
+            ContextMode::Compact,
+            "recall must fall back to compact when memory is disabled"
+        );
+    });
+}
+#[test]
+fn context_mode_invalid_env_ignored() {
+    with_context_mode_env(Some("nonsense"), || {
+        let config: toml::Value =
+            toml::from_str("[memory]\nenabled = true\ncontext_mode = \"recall\"").unwrap();
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        // Unparseable env value is ignored; the TOML value stands.
+        assert_eq!(mem.context_mode, ContextMode::Recall);
+    });
+}
+#[test]
+fn recall_config_from_toml() {
+    with_context_mode_env(None, || {
+        let config: toml::Value =
+            toml::from_str("[memory]\nenabled = true\n[memory.recall]\ntop_k = 3").unwrap();
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        assert_eq!(mem.recall.top_k, 3);
+    });
 }
 #[test]
 fn memory_config_cli_overrides_toml_disabled() {
